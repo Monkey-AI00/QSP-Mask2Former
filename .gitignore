@@ -1,0 +1,16 @@
+assets/
+datasets/
+outputs/
+weights/
+
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
+*.log
+*.pth
+*.pt
+*.ckpt
+.DS_Store
+Thumbs.db
