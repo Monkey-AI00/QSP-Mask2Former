@@ -57,6 +57,7 @@ from detectron2.structures import ImageList
 
 import mask2former  # noqa: F401
 from mask2former import add_maskformer2_config
+from mask2former.modeling.shape_prior_fusion import build_affine_from_query_params, load_prior_tensor
 
 
 def _ensure_dir(p: str) -> None:
@@ -160,6 +161,32 @@ def _save_tensor_heat(name: str, arr01: np.ndarray, out_dir: str, max_side: int)
     _imwrite(os.path.join(out_dir, name), colored)
 
 
+def _save_tensor_gray(name: str, arr01: np.ndarray, out_dir: str, max_side: int) -> None:
+    gray = _to_u8_heat(arr01)
+    gray = _resize_to(gray, (max_side, max_side))
+    _imwrite(os.path.join(out_dir, name), gray)
+
+
+def _save_binary_mask(name: str, mask01: np.ndarray, out_dir: str, max_side: int) -> None:
+    mask_u8 = ((mask01 > 0.5).astype(np.uint8) * 255)
+    mask_u8 = _resize_to(mask_u8, (max_side, max_side))
+    _imwrite(os.path.join(out_dir, name), mask_u8)
+
+
+def _make_affine_grid_prior(h: int, w: int) -> np.ndarray:
+    grid = np.zeros((h, w), dtype=np.float32)
+    step = max(4, min(h, w) // 8)
+    grid[::step, :] = 1.0
+    grid[:, ::step] = 1.0
+    grid[0, :] = 1.0
+    grid[-1, :] = 1.0
+    grid[:, 0] = 1.0
+    grid[:, -1] = 1.0
+    grid[h // 2, :] = 1.0
+    grid[:, w // 2] = 1.0
+    return grid
+
+
 def _select_best_query(model, mask_cls_result: torch.Tensor, mask_pred_result: torch.Tensor) -> tuple[int, torch.Tensor, float]:
     """
     Mirror MaskFormer.instance_inference to locate the best query index.
@@ -233,7 +260,17 @@ def main() -> None:
         images = ImageList.from_tensors(images, model.size_divisibility)
 
         features = model.backbone(images.tensor)
-        outputs = model.sem_seg_head(features)
+        sem_seg_head = model.sem_seg_head
+        mask_features, transformer_encoder_features, multi_scale_features = sem_seg_head.pixel_decoder.forward_features(features)
+        if sem_seg_head.transformer_in_feature == "multi_scale_pixel_decoder":
+            outputs = sem_seg_head.predictor(multi_scale_features, mask_features, None)
+        elif sem_seg_head.transformer_in_feature == "transformer_encoder":
+            assert transformer_encoder_features is not None
+            outputs = sem_seg_head.predictor(transformer_encoder_features, mask_features, None)
+        elif sem_seg_head.transformer_in_feature == "pixel_embedding":
+            outputs = sem_seg_head.predictor(mask_features, mask_features, None)
+        else:
+            outputs = sem_seg_head.predictor(features[sem_seg_head.transformer_in_feature], mask_features, None)
 
         if "pred_prior_masks" not in outputs:
             raise RuntimeError(
@@ -247,6 +284,7 @@ def main() -> None:
         prior_mask_results = outputs.get("pred_prior_masks", None)
         prior_gate_results = outputs.get("pred_prior_gates", None)
         prior_occluder_results = outputs.get("pred_prior_occluders", None)
+        prior_param_results = outputs.get("pred_prior_params", None)
         prior_bank_weight_results = outputs.get("pred_prior_bank_weights", None)
 
         mask_pred_results = F.interpolate(
@@ -294,6 +332,8 @@ def main() -> None:
         fused_mask_logits = mask_pred_result[q_idx].detach().float().cpu().numpy()
         fused_mask_prob = _sigmoid(fused_mask_logits)
         final_mask = best_mask.detach().float().cpu().numpy()
+        mask_features_map = mask_features[0].detach().float().abs().mean(dim=0).cpu().numpy()
+        mask_features_map = _norm01(mask_features_map)
 
         if mask_pred_raw_results is not None:
             raw_mask_result = sem_seg_postprocess(mask_pred_raw_results[0], image_size, height, width)
@@ -330,16 +370,85 @@ def main() -> None:
             occ_mean = 0.0
             occ_map = np.full_like(fused_mask_prob, fill_value=0.0, dtype=np.float32)
 
+        align_params_raw = None
+        align_params_effective = None
+        affine_matrix = None
+        selected_bank_idx = 0
+        selected_prior = None
+        warped_grid = None
+
+        if prior_bank_weight_results is not None:
+            selected_bank_idx = int(prior_bank_weight_results[0, q_idx].detach().float().cpu().argmax().item())
+
+        prior_path = str(getattr(cfg.MODEL.MASK_FORMER, "PRIOR_PATH", "")).strip()
+        if prior_path:
+            prior_bank = load_prior_tensor(prior_path).float()
+            selected_bank_idx = max(0, min(selected_bank_idx, int(prior_bank.shape[0]) - 1))
+            selected_prior = prior_bank[selected_bank_idx, 0].detach().cpu().numpy()
+
+        if prior_param_results is not None:
+            params_t = prior_param_results[0, q_idx].detach().float().cpu()
+            align_params_raw = params_t.numpy()
+            align_params_effective = {
+                "angle_rad": float(params_t[0].item()),
+                "angle_deg": float(params_t[0].item() * 180.0 / np.pi),
+                "log_sx": float(params_t[1].item()),
+                "log_sy": float(params_t[2].item()),
+                "sx": float(torch.exp(params_t[1]).item()),
+                "sy": float(torch.exp(params_t[2]).item()),
+                "tx_raw": float(params_t[3].item()),
+                "ty_raw": float(params_t[4].item()),
+                "tx": float(torch.tanh(params_t[3]).item()),
+                "ty": float(torch.tanh(params_t[4]).item()),
+            }
+
+            affine_t = build_affine_from_query_params(
+                prior_param_results[:, q_idx : q_idx + 1].detach().float()
+            )[0].detach().cpu()
+            affine_matrix = affine_t.numpy()
+
+            if selected_prior is not None:
+                grid_prior = _make_affine_grid_prior(selected_prior.shape[0], selected_prior.shape[1])
+                grid_t = torch.from_numpy(grid_prior[None, None, :, :]).float()
+                grid_warped_t = F.grid_sample(
+                    grid_t,
+                    F.affine_grid(affine_t.unsqueeze(0), size=(1, 1, height, width), align_corners=False),
+                    align_corners=False,
+                    padding_mode="zeros",
+                )[0, 0]
+                warped_grid = np.clip(grid_warped_t.detach().cpu().numpy(), 0.0, 1.0)
+
     max_side = int(max(64, args.max_side))
     _save_tensor_heat("raw_mask.png", raw_mask_prob, args.out_dir, max_side)
+    _save_binary_mask("raw_mask_prediction.png", raw_mask_prob, args.out_dir, max_side)
+    _save_tensor_heat("mask_features.png", mask_features_map, args.out_dir, max_side)
     _save_tensor_heat("aligned_prior.png", prior_mask_prob, args.out_dir, max_side)
     _save_tensor_heat("prior_gate.png", gate_map, args.out_dir, max_side)
     _save_tensor_heat("prior_occluder.png", occ_map, args.out_dir, max_side)
     _save_tensor_heat("fused_mask.png", fused_mask_prob, args.out_dir, max_side)
+    if selected_prior is not None:
+        _save_tensor_gray("selected_prior.png", np.clip(selected_prior, 0.0, 1.0), args.out_dir, max_side)
+    if warped_grid is not None:
+        _save_tensor_gray("affine_grid.png", warped_grid, args.out_dir, max_side)
 
     _imwrite(os.path.join(args.out_dir, "final_mask.png"), (final_mask * 255).astype(np.uint8))
     overlay = _overlay_mask(img_bgr, final_mask.astype(np.float32), color_bgr=(0, 255, 0), alpha=0.45)
     _imwrite(os.path.join(args.out_dir, "final_overlay.png"), overlay)
+
+    with open(os.path.join(args.out_dir, "affine_params.txt"), "w", encoding="utf-8") as f:
+        f.write(f"query_idx={q_idx}\n")
+        f.write(f"prior_path={str(getattr(cfg.MODEL.MASK_FORMER, 'PRIOR_PATH', ''))}\n")
+        f.write(f"selected_bank_idx={selected_bank_idx}\n")
+        if prior_bank_weight_results is not None:
+            bank_weights = prior_bank_weight_results[0, q_idx].detach().float().cpu().numpy().tolist()
+            f.write(f"prior_bank_weights={bank_weights}\n")
+        if align_params_raw is not None:
+            f.write(f"align_params_raw={align_params_raw.tolist()}\n")
+        if align_params_effective is not None:
+            for k, v in align_params_effective.items():
+                f.write(f"{k}={v}\n")
+        if affine_matrix is not None:
+            f.write(f"affine_matrix={affine_matrix.tolist()}\n")
 
     with open(os.path.join(args.out_dir, "meta.txt"), "w", encoding="utf-8") as f:
         f.write(f"image={os.path.abspath(args.image)}\n")
@@ -350,9 +459,14 @@ def main() -> None:
         f.write(f"instance_score={best_score}\n")
         f.write(f"gate_mean={gate_mean}\n")
         f.write(f"occluder_mean={occ_mean}\n")
+        f.write(f"selected_bank_idx={selected_bank_idx}\n")
         if prior_bank_weight_results is not None:
             bank_weights = prior_bank_weight_results[0, q_idx].detach().float().cpu().numpy().tolist()
             f.write(f"prior_bank_weights={bank_weights}\n")
+        if align_params_raw is not None:
+            f.write(f"align_params={align_params_raw.tolist()}\n")
+        if affine_matrix is not None:
+            f.write(f"affine_matrix={affine_matrix.tolist()}\n")
         f.write(f"prior_path={str(getattr(cfg.MODEL.MASK_FORMER, 'PRIOR_PATH', ''))}\n")
 
     print(f"done. saved to: {os.path.abspath(args.out_dir)}")
