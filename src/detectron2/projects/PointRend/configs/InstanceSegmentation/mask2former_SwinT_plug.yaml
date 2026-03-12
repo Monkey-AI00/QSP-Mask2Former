@@ -1,0 +1,25 @@
+_BASE_: "../../../../../Mask2Former/configs/coco/instance-segmentation/swin/maskformer2_swin_tiny_bs16_50ep.yaml"
+
+# plug: 1 类（最终以脚本 register_plug_dataset 读到的 thing_classes 长度为准）
+MODEL:
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 1
+
+# 单卡训练/评测起步超参（8GB 显存友好）
+SOLVER:
+  IMS_PER_BATCH: 1
+  BASE_LR: 0.0001
+  MAX_ITER: 3000
+  STEPS: (2100, 2700)
+
+INPUT:
+  IMAGE_SIZE: 800
+  MIN_SCALE: 0.1
+  MAX_SCALE: 2.0
+
+# 占位：训练/评测脚本会覆盖
+DATASETS:
+  TRAIN: ("plug_train1",)
+  TEST: ("plug_train1",)
+
+

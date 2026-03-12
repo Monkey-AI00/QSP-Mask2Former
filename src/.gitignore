@@ -1,0 +1,45 @@
+# ===== Python / cache =====
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ===== Build artifacts =====
+build/
+dist/
+detectron2/build/
+detectron2/**/build/
+
+# ===== Logs =====
+*.log
+
+# ===== Model weights / large binaries (GitHub 单文件限制 100MB) =====
+*.pth
+*.pt
+*.pkl
+*.onnx
+*.engine
+detectron2/weights/
+detectron2/cleargrasp/cleargrasp-checkpoints/
+
+# ===== Generated outputs =====
+detectron2/projects/PointRend/output/
+detectron2/projects/PointRend/output_live/
+detectron2/projects/PointRend/output_inference/
+ultralytics/runs/
+ultralytics/runs/**/*
+
+# ===== Large point cloud / depth outputs (通常是生成物) =====
+**/*.ply
+**/*.pcd
+**/*.tiff
+**/*.tif
+
+# ===== Nested git repos protection (should not be committed) =====
+**/.git/
+
+

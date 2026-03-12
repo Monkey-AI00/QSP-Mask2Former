@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+Mask2Former 在 plug 数据集上的训练脚本（风格对齐 train_maskrcnn_plug.py / train_plug.py）
+
+你需要准备：
+1) 安装依赖：
+   - Detectron2（建议源码安装）
+   - Mask2Former（本仓库已放在 /home/user/sjw/Yolo_pointrend/Mask2Former）
+   - pip install -r /home/user/sjw/Yolo_pointrend/Mask2Former/requirements.txt
+2) 编译 MSDeformAttn CUDA 扩展（必须，否则无法训练）：
+   cd /home/user/sjw/Yolo_pointrend/Mask2Former/mask2former/modeling/pixel_decoder/ops
+   sh make.sh
+3) 选一个 Mask2Former instance 配置作为 base（推荐 R50 instance config）：
+   /home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml
+4) 初始化权重（强烈建议用 Mask2Former Model Zoo 的 COCO instance 预训练）：
+   https://dl.fbaipublicfiles.com/maskformer/mask2former/coco/instance/maskformer2_R50_bs16_50ep/model_final_3c8ec9.pkl
+
+说明：
+- Mask2Former 使用 AdamW + (常见) MSDeformAttn pixel decoder，单卡需要自己调 batch/LR/分辨率。
+- 本脚本会复用你现有的 register_plug_dataset（过滤 _background_），并自动把 NUM_CLASSES 同步为 thing_classes 的长度。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import Optional
+
+# 控制台降噪（与结果无关的 warning）
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.cuda\.amp\.(autocast|GradScaler).*deprecated.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.load.*weights_only=False.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r".*torch\.meshgrid.*indexing argument.*",
+)
+
+# 添加 detectron2 到路径（必须指向 detectron2 仓库根目录）
+_D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if _D2_ROOT not in sys.path:
+    sys.path.insert(0, _D2_ROOT)
+
+# 添加 Mask2Former 到路径
+_M2F_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", "Mask2Former"))
+if _M2F_ROOT not in sys.path:
+    sys.path.insert(0, _M2F_ROOT)
+
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.config import get_cfg
+from detectron2.engine import default_argument_parser, default_setup, launch
+from detectron2.projects.deeplab import add_deeplab_config
+
+# 复用你的数据集注册逻辑
+from train_plug import register_plug_dataset
+
+
+def _load_mask2former_train_net() -> object:
+    """
+    通过路径加载 Mask2Former 的 train_net.py，避免与 detectron2/projects/PointRend/train_net.py 名字冲突。
+    """
+    train_net_path = os.path.join(_M2F_ROOT, "train_net.py")
+    if not os.path.isfile(train_net_path):
+        raise FileNotFoundError(f"Mask2Former/train_net.py not found: {train_net_path}")
+    spec = importlib.util.spec_from_file_location("mask2former_train_net", train_net_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load spec for mask2former_train_net")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    return mod
+
+
+_m2f_train_net = _load_mask2former_train_net()
+Mask2FormerTrainer = getattr(_m2f_train_net, "Trainer")
+add_maskformer2_config = getattr(__import__("mask2former", fromlist=["add_maskformer2_config"]), "add_maskformer2_config")
+
+
+def setup(args):
+    cfg = get_cfg()
+    add_deeplab_config(cfg)
+    add_maskformer2_config(cfg)
+    cfg.merge_from_file(args.config_file)
+    cfg.merge_from_list(args.opts)
+
+    cfg.defrost()
+    # 数据集与类别数：由 register_plug_dataset 决定
+    cfg.DATASETS.TRAIN = (str(args.dataset_name),)
+    cfg.DATASETS.TEST = (str(args.dataset_name),)
+    # Mask2Former instance config 用 SEM_SEG_HEAD.NUM_CLASSES 表示 thing 类别数（COCO=80）
+    cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES = int(args.num_classes)
+
+    # 初始化权重
+    if str(getattr(args, "weights", "")).strip():
+        cfg.MODEL.WEIGHTS = str(args.weights).strip()
+
+    # 输出目录
+    if str(getattr(args, "output_dir", "")).strip():
+        cfg.OUTPUT_DIR = str(args.output_dir).strip()
+    else:
+        cfg.OUTPUT_DIR = "./output/plug_mask2former"
+
+    # 单卡/小数据集：worker=0 更稳
+    cfg.DATALOADER.NUM_WORKERS = 0
+
+    # 设备
+    import torch
+
+    cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 训练/推理任务开关（确保是 instance seg）
+    cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = True
+
+    cfg.freeze()
+    default_setup(cfg, args)
+
+    # 训练前打印关键信息
+    print("=" * 70)
+    print("[mask2former][setup] config_file:", str(args.config_file))
+    print("[mask2former][setup] dataset_name:", str(args.dataset_name))
+    print("[mask2former][setup] num_classes:", int(args.num_classes))
+    print("[mask2former][setup] device:", str(cfg.MODEL.DEVICE))
+    print("[mask2former][setup] backbone:", str(getattr(cfg.MODEL.BACKBONE, "NAME", "")))
+    if str(getattr(cfg.MODEL.BACKBONE, "NAME", "")) == "D2SwinTransformer":
+        print("[mask2former][setup] swin_embed_dim:", int(getattr(cfg.MODEL.SWIN, "EMBED_DIM", 0)))
+        print("[mask2former][setup] swin_depths:", list(getattr(cfg.MODEL.SWIN, "DEPTHS", [])))
+        print("[mask2former][setup] swin_num_heads:", list(getattr(cfg.MODEL.SWIN, "NUM_HEADS", [])))
+    print("[mask2former][setup] output_dir:", str(cfg.OUTPUT_DIR))
+    print("[mask2former][setup] ims_per_batch:", int(cfg.SOLVER.IMS_PER_BATCH))
+    print("[mask2former][setup] base_lr:", float(cfg.SOLVER.BASE_LR))
+    print("[mask2former][setup] max_iter:", int(cfg.SOLVER.MAX_ITER))
+    print("[mask2former][setup] steps:", tuple(cfg.SOLVER.STEPS))
+    print("[mask2former][setup] prior_on:", bool(getattr(cfg.MODEL.MASK_FORMER, "PRIOR_ON", False)))
+    print("[mask2former][setup] prior_path:", str(getattr(cfg.MODEL.MASK_FORMER, "PRIOR_PATH", "")))
+    print("[mask2former][setup] prior_alpha:", float(getattr(cfg.MODEL.MASK_FORMER, "PRIOR_ALPHA", 1.0)))
+    print(
+        "[mask2former][setup] prior_loss_weight:",
+        float(getattr(cfg.MODEL.MASK_FORMER, "PRIOR_LOSS_WEIGHT", 0.0)),
+    )
+    print("=" * 70)
+    return cfg
+
+
+def main(args):
+    # 注册数据集（复用你已有逻辑）
+    dataset_name, num_classes = register_plug_dataset(args.dataset_root, args.dataset_name, args.json_file)
+    args.dataset_name = dataset_name
+    args.num_classes = num_classes
+
+    cfg = setup(args)
+
+    if args.eval_only:
+        model = Mask2FormerTrainer.build_model(cfg)
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
+        res = Mask2FormerTrainer.test(cfg, model)
+        return res
+
+    trainer = Mask2FormerTrainer(cfg)
+    trainer.resume_or_load(resume=args.resume)
+    return trainer.train()
+
+
+if __name__ == "__main__":
+    parser = default_argument_parser()
+    parser.add_argument("--gpu-id", type=int, default=None, help="指定使用的 GPU ID")
+    parser.add_argument("--dataset-root", default="/home/user/sjw/Yolo_pointrend/detectron2/plug_train1")
+    parser.add_argument("--dataset-name", default="plug_train1")
+    parser.add_argument("--json-file", default="plug_train.json")
+    parser.add_argument("--weights", default="", help="初始化权重（建议用 Mask2Former COCO instance 预训练）")
+    parser.add_argument("--output-dir", default="", help="训练输出目录")
+
+    args = parser.parse_args()
+
+    if args.gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+        print(f"✓ 已设置使用 GPU {args.gpu_id}")
+
+    # 提醒用户检查 ops 编译产物（避免“训练没反应/直接报错”）
+    ops_so = Path(_M2F_ROOT) / "mask2former" / "modeling" / "pixel_decoder" / "ops" / "MultiScaleDeformableAttention.cpython-39-x86_64-linux-gnu.so"
+    if not ops_so.exists():
+        print("⚠️  [mask2former] 未检测到 MSDeformAttn 编译产物：")
+        print(f"    期望存在: {ops_so}")
+        print("    请先执行：")
+        print("      cd /home/user/sjw/Yolo_pointrend/Mask2Former/mask2former/modeling/pixel_decoder/ops && sh make.sh")
+
+    print("Command Line Args:", args)
+    launch(
+        main,
+        args.num_gpus,
+        num_machines=args.num_machines,
+        machine_rank=args.machine_rank,
+        dist_url=args.dist_url,
+        args=(args,),
+    )
+
+

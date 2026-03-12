@@ -1,0 +1,1185 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+扩展评测 + 可视化曲线（按图片建议）：
+
+指标：
+- COCO bbox AP / segm AP（Detectron2 COCOEvaluator）
+- Boundary IoU（实例分割边界 IoU，基于边界带）
+- HD95（95% Hausdorff Distance，像素单位，越小越好）
+- 光照鲁棒性 Δ%（相对 clean 的变化）
+
+评测策略：
+1) 从 clean 数据集生成多档“强曝光/过曝”离线评测集（severity 0~1）
+2) 对每个 severity，分别评测：
+   - BASE（原版 PointRendMaskHead）
+   - PRIOR（ShapeAwareCoarseMaskHead）
+3) 输出表格 + 曲线图
+
+依赖：
+  conda env pointrend: detectron2, torch, cv2, scipy, matplotlib
+
+示例：
+  PYTHONPATH=... conda run -n pointrend python benchmark_extended_metrics.py \
+    --config-file configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml \
+    --clean-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1 \
+    --json-file plug_train.json \
+    --out-root /home/user/sjw/Yolo_pointrend/detectron2/plug_benchmark_cache \
+    --weights-base output/plug_pointrend/model_final.pth \
+    --weights-prior output/plug_pointrend_ft/model_final.pth \
+    --shape-prior-npy /home/user/sjw/Yolo_pointrend/detectron2/plug_canonical_prior.npy \
+    --severities 0 0.25 0.5 0.75 1.0 \
+    --clip --dilate 0 --feather 3
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import shutil
+import sys
+import warnings
+import subprocess
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import time
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+import matplotlib.pyplot as plt
+
+from scipy import ndimage
+
+# -------------------------------
+# 控制台降噪：屏蔽与结果无关的 warning
+# -------------------------------
+# fvcore/detectron2 内部 torch.load 的 FutureWarning（不影响评测）
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.load.*weights_only=False.*",
+)
+# torch.meshgrid indexing 参数提示（不影响评测）
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r".*torch\.meshgrid.*indexing argument.*",
+)
+
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.config import get_cfg
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.engine import DefaultTrainer
+from detectron2.evaluation import COCOEvaluator, inference_on_dataset
+from detectron2.data import build_detection_test_loader
+from detectron2.projects.point_rend import add_pointrend_config
+from detectron2.config import CfgNode
+
+# 触发注册：ShapeAwareCoarseMaskHead
+import custom_heads  # noqa: F401
+
+from highlight_mapper import HighlightAugConfig, apply_synthetic_highlight, _ann_to_mask  # type: ignore
+from train_plug import register_plug_dataset
+
+
+@dataclass
+class InstanceMetrics:
+    boundary_iou: float
+    hd95: float
+
+
+def _fmt(x: float, nd: int = 3) -> str:
+    try:
+        if x is None:
+            return "--"
+        xf = float(x)
+    except Exception:
+        return "--"
+    if not np.isfinite(xf):
+        return "--"
+    return f"{xf:.{nd}f}"
+
+
+def _fmt_ap(x: float) -> str:
+    # AP 通常用百分数显示：99.80 / 100.00
+    return _fmt(x, nd=2)
+
+
+def _fmt_iou(x: float) -> str:
+    return _fmt(x, nd=3)
+
+
+def _fmt_hd(x: float) -> str:
+    return _fmt(x, nd=3)
+
+
+def _collect_metrics(rows: List[dict]) -> Dict[str, Dict[float, dict]]:
+    """
+    rows: list of {method, severity, segm_AP, boundary_iou, hd95, ...}
+    return: method -> severity -> row
+    """
+    out: Dict[str, Dict[float, dict]] = {}
+    for r in rows:
+        m = str(r.get("method", ""))
+        s = float(r.get("severity", 0.0))
+        out.setdefault(m, {})[s] = r
+    return out
+
+
+def _write_table1_latex(
+    *,
+    rows: List[dict],
+    severities: List[float],
+    out_path: str,
+) -> None:
+    """
+    生成论文表 1（截图格式）LaTeX：
+      - Method / Backbone
+      - Segm_AP / Boundary IoU / 95HD 各 5 档 severity
+      - 分组：Feature-based / Geometry-aware
+    """
+    sev = [float(s) for s in severities]
+    mm = _collect_metrics(rows)
+
+    # 表 1 的行顺序与显示名称（method key -> display name）
+    feature_based = [
+        ("MaskRCNN", "Mask R-CNN"),
+        ("BASE", "PointRend"),
+        ("Mask2Former", "Mask2Former"),
+        ("MaskTransfiner", "MaskTransfiner"),
+    ]
+    geometry_aware = [
+        ("Mask2Former+GeoLoss", "M2F + Geo.Loss"),
+        ("Mask2Former+SDF", "M2F + SDF"),
+        ("PRIOR", "Ours"),
+    ]
+
+    def row_line(method_key: str, disp: str) -> str:
+        r_by_s = mm.get(method_key, {})
+        segm = [_fmt_ap((r_by_s.get(s) or {}).get("segm_AP", float("nan"))) for s in sev]
+        biou = [_fmt_iou((r_by_s.get(s) or {}).get("boundary_iou", float("nan"))) for s in sev]
+        hd = [_fmt_hd((r_by_s.get(s) or {}).get("hd95", float("nan"))) for s in sev]
+        cells = segm + biou + hd
+        return " & ".join([disp, "R-50"] + cells) + r" \\"
+
+    # LaTeX 表格：依赖 multirow + booktabs（可选）；这里仅用基础 tabular + \hline，便于直接编译
+    header_sev = " & ".join([f"{s:.2f}" for s in sev])
+    n_sev = len(sev)
+    assert n_sev == 5, "Table1 默认 5 档 severity（0/0.25/0.5/0.75/1.0）。如需更多档请同步修改表头。"
+
+    tex = []
+    tex.append(r"% Auto-generated by benchmark_extended_metrics.py")
+    tex.append(r"\begin{table*}[t]")
+    tex.append(r"\centering")
+    tex.append(r"\caption{不同光照干扰等级下的定量对比结果}")
+    tex.append(r"\resizebox{\textwidth}{!}{%")
+    tex.append(r"\begin{tabular}{l c " + " ".join(["c"] * (n_sev * 3)) + r"}")
+    tex.append(r"\hline")
+    tex.append(
+        r"\multirow{2}{*}{Method} & \multirow{2}{*}{Backbone} & "
+        + r"\multicolumn{5}{c}{Segm\_AP $\uparrow$} & "
+        + r"\multicolumn{5}{c}{Boundary IoU $\uparrow$} & "
+        + r"\multicolumn{5}{c}{95HD $\downarrow$} \\"
+    )
+    tex.append(r"\cline{3-17}")
+    tex.append(r" &  & " + header_sev + " & " + header_sev + " & " + header_sev + r" \\")
+    tex.append(r"\hline")
+    tex.append(r"\multicolumn{17}{l}{\textbf{Feature-based}} \\")
+    tex.append(r"\hline")
+    for k, disp in feature_based:
+        tex.append(row_line(k, disp))
+        tex.append(r"\hline")
+    tex.append(r"\multicolumn{17}{l}{\textbf{Geometry-aware}} \\")
+    tex.append(r"\hline")
+    for k, disp in geometry_aware:
+        tex.append(row_line(k, disp))
+        tex.append(r"\hline")
+    tex.append(r"\end{tabular}}")
+    tex.append(r"\end{table*}")
+    tex_str = "\n".join(tex) + "\n"
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(tex_str)
+
+
+def _write_table1_markdown(
+    *,
+    rows: List[dict],
+    severities: List[float],
+    out_path: str,
+) -> None:
+    """
+    生成一个便于快速预览/复制到报告里的 Markdown 版本（非多级表头，列名带 severity）。
+    """
+    sev = [float(s) for s in severities]
+    mm = _collect_metrics(rows)
+
+    # 与 LaTeX 一致的行顺序
+    ordered = [
+        ("Feature-based", [
+            ("MaskRCNN", "Mask R-CNN"),
+            ("BASE", "PointRend"),
+            ("Mask2Former", "Mask2Former"),
+            ("MaskTransfiner", "MaskTransfiner"),
+        ]),
+        ("Geometry-aware", [
+            ("Mask2Former+GeoLoss", "M2F + Geo.Loss"),
+            ("Mask2Former+SDF", "M2F + SDF"),
+            ("PRIOR", "Ours"),
+        ]),
+    ]
+
+    cols = []
+    for s in sev:
+        cols.append(f"Segm_AP@{s:.2f}")
+    for s in sev:
+        cols.append(f"BoundaryIoU@{s:.2f}")
+    for s in sev:
+        cols.append(f"95HD@{s:.2f}")
+
+    lines = []
+    lines.append("| Group | Method | Backbone | " + " | ".join(cols) + " |")
+    lines.append("|---|---|---|" + "|".join(["---"] * len(cols)) + "|")
+
+    def get_row(method_key: str) -> List[str]:
+        r_by_s = mm.get(method_key, {})
+        segm = [_fmt_ap((r_by_s.get(s) or {}).get("segm_AP", float("nan"))) for s in sev]
+        biou = [_fmt_iou((r_by_s.get(s) or {}).get("boundary_iou", float("nan"))) for s in sev]
+        hd = [_fmt_hd((r_by_s.get(s) or {}).get("hd95", float("nan"))) for s in sev]
+        return segm + biou + hd
+
+    for gname, items in ordered:
+        for k, disp in items:
+            vals = get_row(k)
+            lines.append("| " + " | ".join([gname, disp, "R-50"] + vals) + " |")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Extended benchmark metrics + curves.")
+    p.add_argument("--config-file", required=True)
+    p.add_argument(
+        "--config-file-maskrcnn",
+        default="",
+        help="Mask R-CNN 的 config yaml（例如 projects/PointRend/configs/InstanceSegmentation/mask_rcnn_R_50_FPN_3x_plug.yaml）",
+    )
+    p.add_argument(
+        "--mask2former-root",
+        default="/home/user/sjw/Yolo_pointrend/Mask2Former",
+        help="Mask2Former 项目根目录（用于 import mask2former 与其自定义 config）。",
+    )
+    p.add_argument(
+        "--config-file-mask2former",
+        default="",
+        help="Mask2Former 的 config yaml（例如 detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml）",
+    )
+    p.add_argument(
+        "--transfiner-root",
+        default="/home/user/sjw/Yolo_pointrend/transfiner",
+        help="Mask Transfiner 项目根目录（用于子进程评测，避免 detectron2 包冲突）。",
+    )
+    p.add_argument(
+        "--config-file-transfiner",
+        default="",
+        help="Mask Transfiner 的 config yaml（建议使用 transfiner/configs/transfiner/mask_rcnn_R_50_FPN_3x_plug.yaml）。",
+    )
+    p.add_argument("--clean-root", required=True, help="clean 数据集目录（图片+json）")
+    p.add_argument("--json-file", default="plug_train.json")
+    p.add_argument("--out-root", required=True, help="输出根目录：缓存评测集 + plots + tables")
+
+    p.add_argument("--weights-base", required=True)
+    p.add_argument("--weights-prior", required=True)
+    p.add_argument("--weights-maskrcnn", default="", help="Mask R-CNN 训练好的权重路径（model_final.pth）")
+    p.add_argument("--weights-mask2former", default="", help="Mask2Former 训练好的权重路径（model_final.pth/.pkl）")
+    p.add_argument(
+        "--weights-mask2former-sdf",
+        default="",
+        help="Mask2Former(+SDF) 训练好的权重路径（用于与 baseline Mask2Former 对比）。",
+    )
+    p.add_argument(
+        "--weights-mask2former-geoloss",
+        default="",
+        help="Mask2Former(+Geo.Loss) 训练好的权重路径（可选；用于表1 Geometry-aware: M2F + Geo.Loss）。",
+    )
+    p.add_argument("--weights-transfiner", default="", help="Mask Transfiner 训练好的权重路径（model_final.pth）")
+    p.add_argument("--shape-prior-npy", default="")
+    p.add_argument("--score-thr", type=float, default=0.5)
+
+    p.add_argument("--severities", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0])
+
+    # highlight params at severity=1.0
+    p.add_argument("--spots", type=int, nargs=2, default=[1, 3])
+    p.add_argument("--sigma", type=int, nargs=2, default=[30, 80])
+    p.add_argument("--intensity", type=int, nargs=2, default=[150, 255])
+    # 回滚到“最初版本”评测集生成：不做 focus/clip/dilate/feather，仅使用全图随机高斯强光
+
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--overwrite-cache", action="store_true")
+
+    # -------------------------------
+    # speed benchmark (optional)
+    # -------------------------------
+    p.add_argument(
+        "--eval-speed",
+        action="store_true",
+        help="额外评测推理速度（FPS / ms-per-img）。默认关闭以避免额外耗时。",
+    )
+    p.add_argument(
+        "--speed-severity",
+        type=float,
+        default=0.0,
+        help="用哪一个 severity 对应的评测集来做速度测试（只影响读哪些图片，默认用 clean: 0.0）。",
+    )
+    p.add_argument(
+        "--speed-num-images",
+        type=int,
+        default=200,
+        help="速度测试使用多少张图片（会从该 severity 的评测集里取前 N 张）。",
+    )
+    p.add_argument(
+        "--speed-warmup",
+        type=int,
+        default=20,
+        help="速度测试 warmup 次数（不计时）。",
+    )
+    p.add_argument(
+        "--speed-cuda-sync",
+        action="store_true",
+        help="速度计时前后调用 torch.cuda.synchronize()（CUDA 下更准确，但略慢）。",
+    )
+    return p.parse_args()
+
+
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def _read_coco(json_path: str) -> dict:
+    with open(json_path, "r") as f:
+        return json.load(f)
+
+
+def _build_highlight_cfg(args: argparse.Namespace, severity: float) -> HighlightAugConfig:
+    sev = float(max(0.0, min(1.0, severity)))
+    # severity=0 -> no highlight; >0 -> always apply
+    prob = 0.0 if sev <= 0 else 1.0
+    # intensity scale by severity (保持下限不低于 0)
+    i0, i1 = int(args.intensity[0]), int(args.intensity[1])
+    i0s = int(round(i0 * sev))
+    i1s = int(round(i1 * sev))
+    i0s = max(0, min(255, i0s))
+    i1s = max(0, min(255, i1s))
+    if i1s < i0s:
+        i0s, i1s = i1s, i0s
+
+    return HighlightAugConfig(
+        prob=prob,
+        spots_range=(int(args.spots[0]), int(args.spots[1])),
+        sigma_range=(int(args.sigma[0]), int(args.sigma[1])),
+        intensity_range=(i0s, i1s),
+        # 最初版本：不聚焦目标、不裁剪、不软边（更快）
+        focus_on_object=False,
+        object_bbox_shrink=0.0,
+        clip_to_object=False,
+        object_mask_dilate=0,
+        object_mask_feather=0,
+    )
+
+
+def _make_eval_dataset(
+    clean_root: str,
+    json_file: str,
+    out_root: str,
+    severity: float,
+    hcfg: HighlightAugConfig,
+    overwrite: bool,
+) -> str:
+    """
+    生成离线评测集目录，并返回该目录路径。
+    severity=0 时：直接复制原图（或用 clean_root 作为数据源）。
+    """
+    clean_root = os.path.abspath(clean_root)
+    out_root = os.path.abspath(out_root)
+    json_path = os.path.join(clean_root, json_file)
+    coco = _read_coco(json_path)
+
+    sev_tag = f"s{severity:.2f}".replace(".", "p")
+    out_dir = os.path.join(out_root, f"highlight_{sev_tag}")
+
+    if os.path.exists(out_dir):
+        json_in_cache = os.path.join(out_dir, json_file)
+        # 兼容：历史缓存目录可能不完整（缺 json/缺图）。
+        # 若未开启 overwrite，但缓存不完整，则自动重建，避免后续注册数据集时报 FileNotFoundError。
+        if overwrite or (not os.path.isfile(json_in_cache)):
+            shutil.rmtree(out_dir)
+        else:
+            return out_dir
+    _ensure_dir(out_dir)
+
+    # index: file_name -> image_id, image_id -> annos
+    fn_to_id: Dict[str, int] = {str(im["file_name"]): int(im["id"]) for im in coco.get("images", [])}
+    id_to_anns: Dict[int, List[dict]] = {}
+    for ann in coco.get("annotations", []):
+        id_to_anns.setdefault(int(ann["image_id"]), []).append(ann)
+
+    n = 0
+    for im in coco.get("images", []):
+        fn = str(im.get("file_name", ""))
+        if not fn:
+            continue
+        src = os.path.join(clean_root, fn)
+        dst = os.path.join(out_dir, fn)
+        _ensure_dir(os.path.dirname(dst))
+        bgr = cv2.imread(src, cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        if hcfg.prob <= 0:
+            cv2.imwrite(dst, bgr)
+            n += 1
+            continue
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        dd = None
+        if hcfg.focus_on_object:
+            iid = fn_to_id.get(fn)
+            if iid is not None:
+                dd = {"file_name": src, "annotations": id_to_anns.get(iid, [])}
+        aug_rgb = apply_synthetic_highlight(rgb, hcfg, dataset_dict=dd)
+        aug_bgr = cv2.cvtColor(aug_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(dst, aug_bgr)
+        n += 1
+
+    shutil.copy2(json_path, os.path.join(out_dir, json_file))
+    return out_dir
+
+
+def _mask_to_boundary(mask01: np.ndarray, dilation_ratio: float = 0.02) -> np.ndarray:
+    """
+    二值 mask -> boundary（二值），参考 detectron2 SemSegEvaluator 的实现思路。
+    """
+    mask = (mask01 > 0).astype(np.uint8)
+    if mask.ndim != 2:
+        raise ValueError("mask_to_boundary expects 2D mask")
+    h, w = mask.shape
+    if mask.sum() == 0:
+        return np.zeros_like(mask)
+    diag_len = np.sqrt(h * h + w * w)
+    dilation = max(1, int(round(float(dilation_ratio) * float(diag_len))))
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    # 侵蚀后与原 mask 做差得到边界
+    eroded = cv2.erode(mask, kernel, iterations=dilation)
+    boundary = mask - eroded
+    boundary = (boundary > 0).astype(np.uint8)
+    return boundary
+
+
+def _boundary_iou(gt01: np.ndarray, pr01: np.ndarray) -> float:
+    b_gt = _mask_to_boundary(gt01)
+    b_pr = _mask_to_boundary(pr01)
+    inter = float(np.logical_and(b_gt > 0, b_pr > 0).sum())
+    union = float(np.logical_or(b_gt > 0, b_pr > 0).sum())
+    if union <= 0:
+        return 1.0 if inter <= 0 else 0.0
+    return inter / union
+
+
+def _hd95(gt01: np.ndarray, pr01: np.ndarray) -> float:
+    """
+    95% Hausdorff distance（像素）在边界点集合上计算：
+    使用 distance transform 加速最近邻距离。
+    """
+    gt_b = _mask_to_boundary(gt01)
+    pr_b = _mask_to_boundary(pr01)
+    gt_pts = np.column_stack(np.nonzero(gt_b > 0))
+    pr_pts = np.column_stack(np.nonzero(pr_b > 0))
+    if gt_pts.size == 0 and pr_pts.size == 0:
+        return 0.0
+    if gt_pts.size == 0 or pr_pts.size == 0:
+        # 一方为空：返回图像对角线作为惩罚
+        h, w = gt01.shape
+        return float(np.sqrt(h * h + w * w))
+
+    # dist to nearest boundary in other set
+    # distance_transform_edt 对 True(1) 计算到最近 False(0) 的距离，所以这里用 ~boundary 作为输入
+    pr_dt = ndimage.distance_transform_edt(~(pr_b > 0))
+    gt_dt = ndimage.distance_transform_edt(~(gt_b > 0))
+
+    d_gt_to_pr = pr_dt[gt_pts[:, 0], gt_pts[:, 1]].astype(np.float32)
+    d_pr_to_gt = gt_dt[pr_pts[:, 0], pr_pts[:, 1]].astype(np.float32)
+    d = np.concatenate([d_gt_to_pr, d_pr_to_gt], axis=0)
+    return float(np.percentile(d, 95))
+
+
+def _load_gt_mask(dataset_dict: dict, h: int, w: int) -> Optional[np.ndarray]:
+    annos = dataset_dict.get("annotations", [])
+    if not annos:
+        return None
+    # 只取第一个实例（你的数据集每图1个 plug）；若多实例可扩展成匹配
+    ann = annos[0]
+    m = _ann_to_mask(ann, h=h, w=w)
+    if m is not None:
+        return (m > 0).astype(np.uint8)
+    # fallback bbox
+    if "bbox" in ann:
+        x, y, bw, bh = ann["bbox"]
+        x1, y1 = int(round(x)), int(round(y))
+        x2, y2 = int(round(x + bw)), int(round(y + bh))
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        mm = np.zeros((h, w), dtype=np.uint8)
+        mm[y1 : y2 + 1, x1 : x2 + 1] = 1
+        return mm
+    return None
+
+
+def _predict_first_mask(predictor, img_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """复用一个已构建好的 predictor，避免在每张图里重复构建（极慢）。"""
+    outputs = predictor(img_bgr)
+    inst = outputs.get("instances", None)
+    if inst is None or len(inst) == 0:
+        return None
+    # 取 score 最高的实例
+    if hasattr(inst, "scores"):
+        idx = int(inst.scores.argmax().item())
+        inst = inst[idx : idx + 1]
+    if not hasattr(inst, "pred_masks"):
+        return None
+    pm = inst.pred_masks[0].to("cpu").numpy().astype(np.uint8)
+    return pm
+
+
+def _build_cfg(
+    config_file: str,
+    weights: str,
+    mask_head_name: str,
+    num_classes: int,
+    score_thr: float,
+    dataset_test_name: str,
+) -> "CfgNode":
+    cfg = get_cfg()
+    add_pointrend_config(cfg)
+    cfg.merge_from_file(config_file)
+    cfg.defrost()
+    cfg.MODEL.WEIGHTS = weights
+    cfg.MODEL.ROI_MASK_HEAD.NAME = mask_head_name
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = int(num_classes)
+    cfg.MODEL.POINT_HEAD.NUM_CLASSES = int(num_classes)
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(score_thr)
+    cfg.DATASETS.TEST = (dataset_test_name,)
+    cfg.DATALOADER.NUM_WORKERS = 0
+    cfg.freeze()
+    return cfg
+
+
+def _build_cfg_maskrcnn(
+    config_file: str,
+    weights: str,
+    num_classes: int,
+    score_thr: float,
+    dataset_test_name: str,
+) -> "CfgNode":
+    """
+    Mask R-CNN 的 cfg 构建：
+    - 不调用 add_pointrend_config
+    - 不设置 POINT_HEAD.*
+    """
+    cfg = get_cfg()
+    cfg.merge_from_file(config_file)
+    cfg.defrost()
+    cfg.MODEL.WEIGHTS = weights
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = int(num_classes)
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(score_thr)
+    cfg.DATASETS.TEST = (dataset_test_name,)
+    cfg.DATALOADER.NUM_WORKERS = 0
+    cfg.freeze()
+    return cfg
+
+
+def _build_cfg_mask2former(
+    *,
+    mask2former_root: str,
+    config_file: str,
+    weights: str,
+    num_classes: int,
+    score_thr: float,
+    dataset_test_name: str,
+) -> "CfgNode":
+    """
+    Mask2Former 的 cfg 构建（按 Mask2Former/train_net.py 的做法）：
+    - add_deeplab_config + add_maskformer2_config
+    - 设置 SEM_SEG_HEAD.NUM_CLASSES=thing_classes 长度
+    - 设置 DATASETS.TEST
+    - 用 score_thr 覆盖 OBJECT_MASK_THRESHOLD（便于与其它方法对齐阈值）
+    """
+    m2f_root = os.path.abspath(str(mask2former_root))
+    if m2f_root not in sys.path:
+        sys.path.insert(0, m2f_root)
+
+    # 重要：显式 import 以触发 Mask2Former 的模型/数据注册（META_ARCHITECTURE 等）
+    import mask2former as _mask2former  # noqa: F401  # type: ignore
+
+    from detectron2.projects.deeplab import add_deeplab_config
+    from mask2former import add_maskformer2_config  # type: ignore
+
+    cfg = get_cfg()
+    add_deeplab_config(cfg)
+    add_maskformer2_config(cfg)
+    cfg.merge_from_file(config_file)
+    cfg.defrost()
+    cfg.MODEL.WEIGHTS = weights
+    cfg.DATASETS.TEST = (dataset_test_name,)
+    cfg.DATALOADER.NUM_WORKERS = 0
+    cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES = int(num_classes)
+    # instance-only
+    cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = True
+    # 对齐阈值
+    cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = float(score_thr)
+    cfg.freeze()
+    return cfg
+
+
+def _eval_coco(cfg, dataset_name: str, out_dir: str) -> Dict[str, float]:
+    model = DefaultTrainer.build_model(cfg)
+    DetectionCheckpointer(model).load(cfg.MODEL.WEIGHTS)
+    model.eval()
+    evaluator = COCOEvaluator(dataset_name, output_dir=out_dir)
+    loader = build_detection_test_loader(cfg, dataset_name)
+    results = inference_on_dataset(model, loader, evaluator)
+    # results: {"bbox": {...}, "segm": {...}}
+    out = {}
+    if "bbox" in results and "AP" in results["bbox"]:
+        out["bbox_AP"] = float(results["bbox"]["AP"])
+    if "segm" in results and "AP" in results["segm"]:
+        out["segm_AP"] = float(results["segm"]["AP"])
+    return out
+
+
+def _eval_custom_metrics(cfg, dataset_name: str) -> Dict[str, float]:
+    dicts = DatasetCatalog.get(dataset_name)
+    if not dicts:
+        return {"boundary_iou": float("nan"), "hd95": float("nan")}
+    # 性能优化：DefaultPredictor 构建/加载很重，必须复用
+    from detectron2.engine import DefaultPredictor
+
+    predictor = DefaultPredictor(cfg)
+    boundary_ious: List[float] = []
+    hd95s: List[float] = []
+    for d in dicts:
+        img_bgr = cv2.imread(d["file_name"], cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            continue
+        h, w = img_bgr.shape[:2]
+        gt = _load_gt_mask(d, h=h, w=w)
+        if gt is None:
+            continue
+        pr = _predict_first_mask(predictor, img_bgr)
+        if pr is None:
+            # 无预测：视为全空
+            pr = np.zeros_like(gt)
+        boundary_ious.append(_boundary_iou(gt, pr))
+        hd95s.append(_hd95(gt, pr))
+    return {
+        "boundary_iou": float(np.mean(boundary_ious)) if boundary_ious else float("nan"),
+        "hd95": float(np.mean(hd95s)) if hd95s else float("nan"),
+    }
+
+
+def _eval_transfiner_subprocess(
+    *,
+    transfiner_root: str,
+    config_file: str,
+    weights: str,
+    dataset_root: str,
+    dataset_name: str,
+    json_file: str,
+    score_thr: float,
+    out_dir: str,
+) -> Dict[str, float]:
+    """
+    以子进程方式调用 transfiner/tools/eval_transfiner_extended_metrics.py，
+    解决 `detectron2` 包名冲突问题。
+    """
+    transfiner_root = os.path.abspath(str(transfiner_root))
+    eval_py = os.path.join(transfiner_root, "tools", "eval_transfiner_extended_metrics.py")
+    if not os.path.isfile(eval_py):
+        raise FileNotFoundError(f"transfiner eval script not found: {eval_py}")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = transfiner_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+    cmd = [
+        sys.executable,
+        "-u",
+        eval_py,
+        "--config-file",
+        os.path.abspath(str(config_file)),
+        "--weights",
+        os.path.abspath(str(weights)),
+        "--dataset-root",
+        os.path.abspath(str(dataset_root)),
+        "--dataset-name",
+        str(dataset_name),
+        "--json-file",
+        str(json_file),
+        "--score-thr",
+        str(float(score_thr)),
+        "--output-dir",
+        os.path.abspath(str(out_dir)),
+    ]
+    cp = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            "transfiner eval subprocess failed\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stdout:\n{cp.stdout}\n"
+            f"stderr:\n{cp.stderr}\n"
+        )
+    # parse last non-empty line as json
+    lines = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError(f"transfiner eval produced empty stdout. stderr:\n{cp.stderr}")
+    try:
+        obj = json.loads(lines[-1])
+    except Exception as e:
+        raise RuntimeError(f"failed to parse transfiner eval json. last_line={lines[-1]!r}\nerr={e}\nfull_stdout:\n{cp.stdout}")
+    return {
+        "bbox_AP": float(obj.get("bbox_AP", float("nan"))),
+        "segm_AP": float(obj.get("segm_AP", float("nan"))),
+        "boundary_iou": float(obj.get("boundary_iou", float("nan"))),
+        "hd95": float(obj.get("hd95", float("nan"))),
+    }
+
+
+def _eval_speed(
+    *,
+    cfg,
+    dataset_name: str,
+    num_images: int,
+    warmup: int,
+    cuda_sync: bool,
+) -> Dict[str, float]:
+    """
+    评测推理速度（FPS / ms-per-img），尽量减少 I/O 干扰：
+    - 先把 N 张图片读入内存
+    - warmup 若干次（不计时）
+    - 正式计时 N 次
+    """
+    dicts = DatasetCatalog.get(dataset_name)
+    if not dicts:
+        return {"fps": float("nan"), "ms_per_img": float("nan"), "speed_num_images": 0}
+
+    # preload images
+    imgs: List[np.ndarray] = []
+    for d in dicts[: max(0, int(num_images))]:
+        img_bgr = cv2.imread(d["file_name"], cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            continue
+        imgs.append(img_bgr)
+    if not imgs:
+        return {"fps": float("nan"), "ms_per_img": float("nan"), "speed_num_images": 0}
+
+    from detectron2.engine import DefaultPredictor
+
+    predictor = DefaultPredictor(cfg)
+
+    # optional CUDA sync for accurate timing
+    sync = None
+    if bool(cuda_sync):
+        try:
+            import torch
+
+            if torch.cuda.is_available() and str(getattr(cfg.MODEL, "DEVICE", "")).startswith("cuda"):
+                sync = torch.cuda.synchronize
+        except Exception:
+            sync = None
+
+    w = max(0, int(warmup))
+    for i in range(w):
+        _ = predictor(imgs[i % len(imgs)])
+
+    if sync is not None:
+        sync()
+    t0 = time.perf_counter()
+    for img in imgs:
+        _ = predictor(img)
+    if sync is not None:
+        sync()
+    t1 = time.perf_counter()
+
+    dt = max(1e-9, float(t1 - t0))
+    n = int(len(imgs))
+    fps = float(n) / dt
+    ms = 1000.0 * dt / float(n)
+    return {"fps": fps, "ms_per_img": ms, "speed_num_images": n}
+
+
+def _plot_curves(rows: List[dict], out_dir: str) -> None:
+    _ensure_dir(out_dir)
+    # rows fields: method, severity, segm_AP, bbox_AP, boundary_iou, hd95
+    methods = sorted({r["method"] for r in rows})
+    severities = sorted({float(r["severity"]) for r in rows})
+
+    def plot_metric(key: str, ylabel: str, fname: str, invert: bool = False):
+        plt.figure(figsize=(7, 4))
+        for m in methods:
+            ys = []
+            for s in severities:
+                rr = next(r for r in rows if r["method"] == m and float(r["severity"]) == s)
+                ys.append(rr.get(key, np.nan))
+            plt.plot(severities, ys, marker="o", label=m)
+        plt.xlabel("Highlight severity")
+        plt.ylabel(ylabel)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        if invert:
+            plt.gca().invert_yaxis()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, fname), dpi=200)
+        plt.close()
+
+    plot_metric("segm_AP", "COCO segm AP", "curve_segm_ap.png")
+    plot_metric("bbox_AP", "COCO bbox AP", "curve_bbox_ap.png")
+    plot_metric("boundary_iou", "Boundary IoU (mean)", "curve_boundary_iou.png")
+    plot_metric("hd95", "HD95 (px, mean, lower=better)", "curve_hd95.png", invert=False)
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    out_root = os.path.abspath(args.out_root)
+    cache_dir = os.path.join(out_root, "datasets_cache")
+    plots_dir = os.path.join(out_root, "plots")
+    tables_dir = os.path.join(out_root, "tables")
+    for d in [cache_dir, plots_dir, tables_dir]:
+        _ensure_dir(d)
+
+    if args.shape_prior_npy.strip():
+        os.environ["SHAPE_PRIOR_PATH"] = os.path.abspath(args.shape_prior_npy.strip())
+
+    # 生成多档评测集
+    dataset_roots: Dict[float, str] = {}
+    for s in args.severities:
+        hcfg = _build_highlight_cfg(args, s)
+        print(
+            f"[dataset_gen] severity={float(s):.2f} "
+            f"prob={hcfg.prob} clip={hcfg.clip_to_object} "
+            f"intensity={hcfg.intensity_range}"
+        )
+        ds_root = _make_eval_dataset(
+            clean_root=args.clean_root,
+            json_file=args.json_file,
+            out_root=cache_dir,
+            severity=float(s),
+            hcfg=hcfg,
+            overwrite=args.overwrite_cache,
+        )
+        dataset_roots[float(s)] = ds_root
+
+    rows: List[dict] = []
+
+    # 两个方法
+    methods: List[dict] = [
+        {"method": "BASE", "kind": "pointrend", "weights": os.path.abspath(args.weights_base), "head": "PointRendMaskHead"},
+        {"method": "PRIOR", "kind": "pointrend", "weights": os.path.abspath(args.weights_prior), "head": "ShapeAwareCoarseMaskHead"},
+    ]
+    if str(getattr(args, "weights_maskrcnn", "")).strip():
+        if not str(getattr(args, "config_file_maskrcnn", "")).strip():
+            raise ValueError("提供 --weights-maskrcnn 时必须同时提供 --config-file-maskrcnn")
+        methods.append(
+            {
+                "method": "MaskRCNN",
+                "kind": "maskrcnn",
+                "weights": os.path.abspath(str(args.weights_maskrcnn).strip()),
+                "config": os.path.abspath(str(args.config_file_maskrcnn).strip()),
+            }
+        )
+    if str(getattr(args, "weights_mask2former", "")).strip():
+        if not str(getattr(args, "config_file_mask2former", "")).strip():
+            raise ValueError("提供 --weights-mask2former 时必须同时提供 --config-file-mask2former")
+        methods.append(
+            {
+                "method": "Mask2Former",
+                "kind": "mask2former",
+                "weights": os.path.abspath(str(args.weights_mask2former).strip()),
+                "config": os.path.abspath(str(args.config_file_mask2former).strip()),
+            }
+        )
+    if str(getattr(args, "weights_mask2former_sdf", "")).strip():
+        if not str(getattr(args, "config_file_mask2former", "")).strip():
+            raise ValueError("提供 --weights-mask2former-sdf 时必须同时提供 --config-file-mask2former")
+        methods.append(
+            {
+                "method": "Mask2Former+SDF",
+                "kind": "mask2former",
+                "weights": os.path.abspath(str(args.weights_mask2former_sdf).strip()),
+                "config": os.path.abspath(str(args.config_file_mask2former).strip()),
+            }
+        )
+    if str(getattr(args, "weights_mask2former_geoloss", "")).strip():
+        if not str(getattr(args, "config_file_mask2former", "")).strip():
+            raise ValueError("提供 --weights-mask2former-geoloss 时必须同时提供 --config-file-mask2former")
+        methods.append(
+            {
+                "method": "Mask2Former+GeoLoss",
+                "kind": "mask2former",
+                "weights": os.path.abspath(str(args.weights_mask2former_geoloss).strip()),
+                "config": os.path.abspath(str(args.config_file_mask2former).strip()),
+            }
+        )
+    if str(getattr(args, "weights_transfiner", "")).strip():
+        if not str(getattr(args, "config_file_transfiner", "")).strip():
+            raise ValueError("提供 --weights-transfiner 时必须同时提供 --config-file-transfiner")
+        methods.append(
+            {
+                "method": "MaskTransfiner",
+                "kind": "transfiner",
+                "weights": os.path.abspath(str(args.weights_transfiner).strip()),
+                "config": os.path.abspath(str(args.config_file_transfiner).strip()),
+                "root": os.path.abspath(str(args.transfiner_root).strip()),
+            }
+        )
+
+    for severity, ds_root in sorted(dataset_roots.items(), key=lambda x: x[0]):
+        # 注册 dataset
+        dataset_name = f"plug_bench_s{severity:.2f}".replace(".", "p")
+        dataset_name, num_classes = register_plug_dataset(ds_root, dataset_name, args.json_file)
+
+        for m in methods:
+            method = str(m["method"])
+            kind = str(m["kind"])
+            weights = str(m["weights"])
+
+            if kind == "maskrcnn":
+                cfg = _build_cfg_maskrcnn(
+                    config_file=str(m["config"]),
+                    weights=weights,
+                    num_classes=num_classes,
+                    score_thr=args.score_thr,
+                    dataset_test_name=dataset_name,
+                )
+            elif kind == "mask2former":
+                cfg = _build_cfg_mask2former(
+                    mask2former_root=str(args.mask2former_root),
+                    config_file=str(m["config"]),
+                    weights=weights,
+                    num_classes=num_classes,
+                    score_thr=args.score_thr,
+                    dataset_test_name=dataset_name,
+                )
+            elif kind == "transfiner":
+                # 子进程评测（避免 detectron2 包冲突）
+                run_tag = f"{method}_s{severity:.2f}".replace(".", "p")
+                run_out = os.path.join(out_root, "runs", run_tag)
+                _ensure_dir(run_out)
+                coco_metrics = _eval_transfiner_subprocess(
+                    transfiner_root=str(m["root"]),
+                    config_file=str(m["config"]),
+                    weights=weights,
+                    dataset_root=str(ds_root),
+                    dataset_name=str(dataset_name),
+                    json_file=str(args.json_file),
+                    score_thr=float(args.score_thr),
+                    out_dir=str(run_out),
+                )
+                row = {
+                    "method": method,
+                    "severity": float(severity),
+                    **coco_metrics,
+                }
+                rows.append(row)
+                print(
+                    f"[{method}] severity={severity:.2f}  segm_AP={row.get('segm_AP')}  "
+                    f"boundary_iou={row.get('boundary_iou')}  hd95={row.get('hd95')}"
+                )
+                continue
+            else:
+                cfg = _build_cfg(
+                    config_file=os.path.abspath(args.config_file),
+                    weights=weights,
+                    mask_head_name=str(m["head"]),
+                    num_classes=num_classes,
+                    score_thr=args.score_thr,
+                    dataset_test_name=dataset_name,
+                )
+
+            run_tag = f"{method}_s{severity:.2f}".replace(".", "p")
+            run_out = os.path.join(out_root, "runs", run_tag)
+            _ensure_dir(run_out)
+
+            coco_metrics = _eval_coco(cfg, dataset_name, out_dir=run_out)
+            custom = _eval_custom_metrics(cfg, dataset_name)
+
+            row = {
+                "method": method,
+                "severity": float(severity),
+                **coco_metrics,
+                **custom,
+            }
+            rows.append(row)
+            print(f"[{method}] severity={severity:.2f}  segm_AP={row.get('segm_AP')}  boundary_iou={row.get('boundary_iou')}  hd95={row.get('hd95')}")
+
+    # speed benchmark (optional, separate table)
+    if bool(getattr(args, "eval_speed", False)):
+        import csv
+
+        # choose dataset at requested severity (fallback to closest in args.severities)
+        s0 = float(max(0.0, min(1.0, float(getattr(args, "speed_severity", 0.0)))))
+        if s0 not in dataset_roots:
+            ss = sorted(dataset_roots.keys())
+            s0 = min(ss, key=lambda x: abs(float(x) - s0)) if ss else 0.0
+        speed_dataset_name = f"plug_bench_s{s0:.2f}".replace(".", "p")
+
+        speed_rows: List[dict] = []
+        for m in methods:
+            method = str(m["method"])
+            kind = str(m["kind"])
+            weights = str(m["weights"])
+
+            if kind == "maskrcnn":
+                cfg = _build_cfg_maskrcnn(
+                    config_file=str(m["config"]),
+                    weights=weights,
+                    num_classes=num_classes,
+                    score_thr=args.score_thr,
+                    dataset_test_name=speed_dataset_name,
+                )
+            elif kind == "mask2former":
+                cfg = _build_cfg_mask2former(
+                    mask2former_root=str(args.mask2former_root),
+                    config_file=str(m["config"]),
+                    weights=weights,
+                    num_classes=num_classes,
+                    score_thr=args.score_thr,
+                    dataset_test_name=speed_dataset_name,
+                )
+            elif kind == "transfiner":
+                # transfiner 与主工程 detectron2 存在包冲突，精确速度评测需要在 transfiner 子进程内完成。
+                # 这里先写 NaN，避免影响主流程产出 metrics 表格。
+                speed_row = {
+                    "method": method,
+                    "severity": float(s0),
+                    "device": "n/a",
+                    "fps": float("nan"),
+                    "ms_per_img": float("nan"),
+                    "speed_num_images": 0,
+                }
+                speed_rows.append(speed_row)
+                print(f"[SPEED] {method} severity={s0:.2f} skipped (cross-repo detectron2 conflict)")
+                continue
+            else:
+                cfg = _build_cfg(
+                    config_file=os.path.abspath(args.config_file),
+                    weights=weights,
+                    mask_head_name=str(m["head"]),
+                    num_classes=num_classes,
+                    score_thr=args.score_thr,
+                    dataset_test_name=speed_dataset_name,
+                )
+
+            sp = _eval_speed(
+                cfg=cfg,
+                dataset_name=speed_dataset_name,
+                num_images=int(getattr(args, "speed_num_images", 200)),
+                warmup=int(getattr(args, "speed_warmup", 20)),
+                cuda_sync=bool(getattr(args, "speed_cuda_sync", False)),
+            )
+            speed_row = {
+                "method": method,
+                "severity": float(s0),
+                "device": str(getattr(cfg.MODEL, "DEVICE", "")),
+                **sp,
+            }
+            speed_rows.append(speed_row)
+            print(
+                f"[SPEED] {method} severity={s0:.2f} "
+                f"fps={speed_row.get('fps')} ms_per_img={speed_row.get('ms_per_img')} "
+                f"num_images={speed_row.get('speed_num_images')} device={speed_row.get('device')}"
+            )
+
+        # write speed table
+        with open(os.path.join(tables_dir, "speed_fps.json"), "w") as f:
+            json.dump(speed_rows, f, indent=2)
+        speed_keys = ["method", "severity", "device", "fps", "ms_per_img", "speed_num_images"]
+        with open(os.path.join(tables_dir, "speed_fps.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=speed_keys)
+            w.writeheader()
+            for r in speed_rows:
+                w.writerow({k: r.get(k, "") for k in speed_keys})
+
+    # 保存 rows
+    with open(os.path.join(tables_dir, "metrics_raw.json"), "w") as f:
+        json.dump(rows, f, indent=2)
+
+    # CSV table
+    import csv
+
+    keys = ["method", "severity", "bbox_AP", "segm_AP", "boundary_iou", "hd95"]
+    with open(os.path.join(tables_dir, "metrics_raw.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in keys})
+
+    # 论文表 1：按截图格式输出（LaTeX + Markdown 预览版）
+    try:
+        s_list = sorted({float(r["severity"]) for r in rows})
+        table1_tex = os.path.join(tables_dir, "table1_lighting.tex")
+        table1_md = os.path.join(tables_dir, "table1_lighting.md")
+        _write_table1_latex(rows=rows, severities=s_list, out_path=table1_tex)
+        _write_table1_markdown(rows=rows, severities=s_list, out_path=table1_md)
+        print(f"[TABLE1] written: {table1_tex}")
+        print(f"[TABLE1] written: {table1_md}")
+    except Exception as e:
+        print(f"[TABLE1] skipped due to error: {e}")
+
+    # robustness Δ%（相对 severity=0）
+    base0 = {r["method"]: r for r in rows if float(r["severity"]) == 0.0}
+    delta_rows: List[dict] = []
+    for r in rows:
+        if float(r["severity"]) != max(dataset_roots.keys()):
+            continue
+        m = r["method"]
+        r0 = base0.get(m, {})
+        seg0 = float(r0.get("segm_AP", np.nan))
+        bbox0 = float(r0.get("bbox_AP", np.nan))
+        biou0 = float(r0.get("boundary_iou", np.nan))
+        hd0 = float(r0.get("hd95", np.nan))
+
+        def rel(a, b) -> float:
+            if not np.isfinite(a) or not np.isfinite(b) or b == 0:
+                return float("nan")
+            return 100.0 * (a - b) / b
+
+        delta_rows.append(
+            {
+                "method": m,
+                "severity": float(r["severity"]),
+                "segm_AP_delta_pct": rel(float(r.get("segm_AP", np.nan)), seg0),
+                "bbox_AP_delta_pct": rel(float(r.get("bbox_AP", np.nan)), bbox0),
+                "boundary_iou_delta_pct": rel(float(r.get("boundary_iou", np.nan)), biou0),
+                "hd95_delta_pct": rel(float(r.get("hd95", np.nan)), hd0),
+            }
+        )
+
+    with open(os.path.join(tables_dir, "robustness_delta.json"), "w") as f:
+        json.dump(delta_rows, f, indent=2)
+
+    # plots
+    _plot_curves(rows, plots_dir)
+    print(f"done. outputs in: {out_root}")
+
+
+if __name__ == "__main__":
+    main()
+
+
