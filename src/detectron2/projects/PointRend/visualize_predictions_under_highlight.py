@@ -15,12 +15,12 @@
 示例：
   PYTHONPATH=... conda run -n pointrend python visualize_predictions_under_highlight.py \
     --config-file configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml \
-    --dataset-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1_highlight_eval \
+    --dataset-root /home/users1/sjw/cursor/workspace/datasets/plug_train1_highlight_eval \
     --json-file plug_train.json \
     --weights-base /path/to/base/model_final.pth \
     --weights-prior /path/to/prior/model_final.pth \
-    --shape-prior-npy /home/user/sjw/Yolo_pointrend/detectron2/plug_canonical_prior.npy \
-    --out-dir ./output/pred_vis_highlight \
+    --shape-prior-npy /home/users1/sjw/cursor/workspace/outputs/plug_prior/plug_canonical_prior.npy \
+    --out-dir /home/users1/sjw/cursor/workspace/outputs/output/pred_vis_highlight \
     --num 20 --seed 0
 """
 

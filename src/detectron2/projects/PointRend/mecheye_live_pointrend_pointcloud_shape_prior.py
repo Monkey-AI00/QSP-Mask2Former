@@ -598,7 +598,9 @@ def main():
     parser = argparse.ArgumentParser(description="Mech-Eye Live -> PointRend(ShapePrior) -> Mask -> PointCloud")
     parser.add_argument(
         "--config-file",
-        default="/home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml",
+        default=os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "configs", "InstanceSegmentation", "pointrend_rcnn_R_50_FPN_3x_plug.yaml")
+        ),
     )
 
     # 对齐 visualize_predictions_under_highlight.py 的参数命名
@@ -617,7 +619,7 @@ def main():
     parser.add_argument(
         "--shape-prior-npy",
         default="",
-        help="形状先验 .npy 路径（会写入环境变量 SHAPE_PRIOR_PATH；留空则由 custom_heads.py 使用默认路径 detectron2/plug_canonical_prior.npy）",
+        help="形状先验 .npy 路径（会写入环境变量 SHAPE_PRIOR_PATH；留空则由 custom_heads.py 使用默认路径 outputs/plug_prior/plug_canonical_prior.npy）",
     )
     parser.add_argument(
         "--mode",

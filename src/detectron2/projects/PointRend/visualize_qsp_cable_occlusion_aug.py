@@ -14,11 +14,11 @@
   - side_by_side/ 原图 + 增强图 并排对比
 
 示例：
-  PYTHONPATH=/home/user/sjw/Yolo_pointrend/detectron2:/home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend:/home/user/sjw/Yolo_pointrend/Mask2Former \
-  python /home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/visualize_qsp_cable_occlusion_aug.py \
-    --dataset-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train_merged \
+  PYTHONPATH=/home/users1/sjw/cursor/workspace/src/detectron2:/home/users1/sjw/cursor/workspace/src/detectron2/projects/PointRend:/home/users1/sjw/cursor/Mask2Former \
+  python /home/users1/sjw/cursor/workspace/src/detectron2/projects/PointRend/visualize_qsp_cable_occlusion_aug.py \
+    --dataset-root /home/users1/sjw/cursor/workspace/datasets/plug_train_merged \
     --json-file plug_train.json \
-    --out-dir /home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/output/cable_aug_vis \
+    --out-dir /home/users1/sjw/cursor/workspace/outputs/output/cable_aug_vis \
     --index-range 1-8 --index-base 1 --num 8 --seed 0
 """
 
@@ -40,7 +40,8 @@ _D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _D2_ROOT not in sys.path:
     sys.path.insert(0, _D2_ROOT)
 
-_M2F_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", "Mask2Former"))
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", ".."))
+_M2F_ROOT = os.path.abspath(os.path.join(_WORKSPACE_ROOT, "..", "Mask2Former"))
 if _M2F_ROOT not in sys.path:
     sys.path.insert(0, _M2F_ROOT)
 

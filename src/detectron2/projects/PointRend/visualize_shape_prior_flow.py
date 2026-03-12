@@ -13,10 +13,10 @@
 用法示例：
   PYTHONPATH=... python visualize_shape_prior_flow.py \
     --config-file configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml \
-    --weights output/plug_pointrend_ft/model_final.pth \
+    --weights /home/users1/sjw/cursor/workspace/outputs/output/plug_pointrend_ft/model_final.pth \
     --image /path/to/xxx.png \
-    --out-dir ./output/shape_flow_vis \
-    --shape-prior-npy /home/user/sjw/Yolo_pointrend/detectron2/plug_canonical_prior.npy
+    --out-dir /home/users1/sjw/cursor/workspace/outputs/output/shape_flow_vis \
+    --shape-prior-npy /home/users1/sjw/cursor/workspace/outputs/plug_prior/plug_canonical_prior.npy
 """
 
 from __future__ import annotations

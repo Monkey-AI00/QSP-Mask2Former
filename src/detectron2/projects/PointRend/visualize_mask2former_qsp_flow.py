@@ -33,7 +33,8 @@ _D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _D2_ROOT not in sys.path:
     sys.path.insert(0, _D2_ROOT)
 
-_M2F_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", "Mask2Former"))
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", ".."))
+_M2F_ROOT = os.path.abspath(os.path.join(_WORKSPACE_ROOT, "..", "Mask2Former"))
 if _M2F_ROOT not in sys.path:
     sys.path.insert(0, _M2F_ROOT)
 

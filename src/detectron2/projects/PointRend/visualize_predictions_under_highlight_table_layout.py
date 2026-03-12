@@ -15,16 +15,16 @@
 示例：
   PYTHONPATH=/path/to/detectron2:/path/to/detectron2/projects/PointRend:/path/to/Mask2Former \
   python -u visualize_predictions_under_highlight_table_layout.py \
-    --dataset-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1_highlight_eval \
+    --dataset-root /home/users1/sjw/cursor/workspace/datasets/plug_train1_highlight_eval \
     --json-file plug_train.json \
-    --out-dir ./output/pred_vis_table1 \
-    --mask2former-root /home/user/sjw/Yolo_pointrend/Mask2Former \
-    --config-mask2former /home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml \
+    --out-dir /home/users1/sjw/cursor/workspace/outputs/output/pred_vis_table1 \
+    --mask2former-root /home/users1/sjw/cursor/Mask2Former \
+    --config-mask2former /home/users1/sjw/cursor/workspace/src/detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml \
     --weights-mask2former /path/to/m2f_base/model_final.pth \
     --weights-mask2former-sdf /path/to/m2f_sdf/model_final.pth \
-    --config-pointrend /home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml \
+    --config-pointrend /home/users1/sjw/cursor/workspace/src/detectron2/projects/PointRend/configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml \
     --weights-spg /path/to/spg_pointrend/model_final.pth \
-    --shape-prior-npy /home/user/sjw/Yolo_pointrend/detectron2/plug_canonical_prior.npy \
+    --shape-prior-npy /home/users1/sjw/cursor/workspace/outputs/plug_prior/plug_canonical_prior.npy \
     --num-rows 4 --scan-max 200 --score-thr 0.5
 """
 

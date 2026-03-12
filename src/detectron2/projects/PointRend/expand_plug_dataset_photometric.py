@@ -11,11 +11,11 @@
 - 适合你当前的“强光鲁棒性”扩充；如果要旋转/缩放/裁剪等几何增强，必须同步变换 polygon/RLE。
 
 示例：
-  PYTHONPATH=/home/user/sjw/Yolo_pointrend/detectron2:/home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend \
+  PYTHONPATH=/home/users1/sjw/cursor/workspace/src/detectron2:/home/users1/sjw/cursor/workspace/src/detectron2/projects/PointRend \
   python -u expand_plug_dataset_photometric.py \
-    --in-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1 \
+    --in-root /home/users1/sjw/cursor/workspace/datasets/plug_train1 \
     --json-file plug_train.json \
-    --out-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1_aug \
+    --out-root /home/users1/sjw/cursor/workspace/datasets/plug_train1_aug \
     --copies 3 \
     --include-original \
     --prob 1.0 --focus object --clip --dilate 20 --feather 0 \

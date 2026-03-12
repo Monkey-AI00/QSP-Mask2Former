@@ -1,4 +1,4 @@
-_BASE_: "../../../../../Mask2Former/configs/coco/instance-segmentation/swin/maskformer2_swin_large_IN21k_384_bs16_100ep.yaml"
+_BASE_: "../../../../../../../Mask2Former/configs/coco/instance-segmentation/swin/maskformer2_swin_large_IN21k_384_bs16_100ep.yaml"
 
 # plug: 1 类（最终以脚本 register_plug_dataset 读到的 thing_classes 长度为准）
 MODEL:

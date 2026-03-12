@@ -30,9 +30,9 @@ from detectron2.projects.point_rend import ShapePriorAdapter
 
 
 def _default_prior_path() -> str:
-    # 默认指向 detectron2/plug_canonical_prior.npy（Phase-1 输出）
+    # 默认指向当前仓库下 outputs/plug_prior/plug_canonical_prior.npy（Phase-1 输出）
     here = os.path.dirname(os.path.abspath(__file__))  # .../detectron2/projects/PointRend
-    return os.path.abspath(os.path.join(here, "..", "..", "plug_canonical_prior.npy"))
+    return os.path.abspath(os.path.join(here, "..", "..", "..", "..", "outputs", "plug_prior", "plug_canonical_prior.npy"))
 
 
 @ROI_MASK_HEAD_REGISTRY.register()

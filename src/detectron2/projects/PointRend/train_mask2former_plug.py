@@ -5,13 +5,13 @@ Mask2Former 在 plug 数据集上的训练脚本（风格对齐 train_maskrcnn_p
 你需要准备：
 1) 安装依赖：
    - Detectron2（建议源码安装）
-   - Mask2Former（本仓库已放在 /home/user/sjw/Yolo_pointrend/Mask2Former）
-   - pip install -r /home/user/sjw/Yolo_pointrend/Mask2Former/requirements.txt
+   - Mask2Former（当前工程默认从仓库同级目录 `../Mask2Former` 查找）
+   - pip install -r ../Mask2Former/requirements.txt
 2) 编译 MSDeformAttn CUDA 扩展（必须，否则无法训练）：
-   cd /home/user/sjw/Yolo_pointrend/Mask2Former/mask2former/modeling/pixel_decoder/ops
+   cd ../Mask2Former/mask2former/modeling/pixel_decoder/ops
    sh make.sh
 3) 选一个 Mask2Former instance 配置作为 base（推荐 R50 instance config）：
-   /home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml
+   src/detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml
 4) 初始化权重（强烈建议用 Mask2Former Model Zoo 的 COCO instance 预训练）：
    https://dl.fbaipublicfiles.com/maskformer/mask2former/coco/instance/maskformer2_R50_bs16_50ep/model_final_3c8ec9.pkl
 
@@ -51,8 +51,13 @@ _D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _D2_ROOT not in sys.path:
     sys.path.insert(0, _D2_ROOT)
 
+# 当前仓库结构：
+# - workspace/src/detectron2
+# - ../Mask2Former
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", ".."))
+
 # 添加 Mask2Former 到路径
-_M2F_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", "Mask2Former"))
+_M2F_ROOT = os.path.abspath(os.path.join(_WORKSPACE_ROOT, "..", "Mask2Former"))
 if _M2F_ROOT not in sys.path:
     sys.path.insert(0, _M2F_ROOT)
 
@@ -174,7 +179,7 @@ def main(args):
 if __name__ == "__main__":
     parser = default_argument_parser()
     parser.add_argument("--gpu-id", type=int, default=None, help="指定使用的 GPU ID")
-    parser.add_argument("--dataset-root", default="/home/user/sjw/Yolo_pointrend/detectron2/plug_train1")
+    parser.add_argument("--dataset-root", default=os.path.join(_WORKSPACE_ROOT, "datasets", "plug_train1"))
     parser.add_argument("--dataset-name", default="plug_train1")
     parser.add_argument("--json-file", default="plug_train.json")
     parser.add_argument("--weights", default="", help="初始化权重（建议用 Mask2Former COCO instance 预训练）")
@@ -192,7 +197,7 @@ if __name__ == "__main__":
         print("⚠️  [mask2former] 未检测到 MSDeformAttn 编译产物：")
         print(f"    期望存在: {ops_so}")
         print("    请先执行：")
-        print("      cd /home/user/sjw/Yolo_pointrend/Mask2Former/mask2former/modeling/pixel_decoder/ops && sh make.sh")
+        print(f"      cd {Path(_M2F_ROOT) / 'mask2former' / 'modeling' / 'pixel_decoder' / 'ops'} && sh make.sh")
 
     print("Command Line Args:", args)
     launch(

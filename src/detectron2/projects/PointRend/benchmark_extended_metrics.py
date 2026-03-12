@@ -22,12 +22,12 @@
 示例：
   PYTHONPATH=... conda run -n pointrend python benchmark_extended_metrics.py \
     --config-file configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml \
-    --clean-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1 \
+    --clean-root /home/users1/sjw/cursor/workspace/datasets/plug_train1 \
     --json-file plug_train.json \
-    --out-root /home/user/sjw/Yolo_pointrend/detectron2/plug_benchmark_cache \
-    --weights-base output/plug_pointrend/model_final.pth \
-    --weights-prior output/plug_pointrend_ft/model_final.pth \
-    --shape-prior-npy /home/user/sjw/Yolo_pointrend/detectron2/plug_canonical_prior.npy \
+    --out-root /home/users1/sjw/cursor/workspace/outputs/plug_benchmark_cache \
+    --weights-base /home/users1/sjw/cursor/workspace/outputs/output/plug_pointrend/model_final.pth \
+    --weights-prior /home/users1/sjw/cursor/workspace/outputs/output/plug_pointrend_ft/model_final.pth \
+    --shape-prior-npy /home/users1/sjw/cursor/workspace/outputs/plug_prior/plug_canonical_prior.npy \
     --severities 0 0.25 0.5 0.75 1.0 \
     --clip --dilate 0 --feather 3
 """
@@ -271,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--mask2former-root",
-        default="/home/user/sjw/Yolo_pointrend/Mask2Former",
+        default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "Mask2Former")),
         help="Mask2Former 项目根目录（用于 import mask2former 与其自定义 config）。",
     )
     p.add_argument(
@@ -281,7 +281,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--transfiner-root",
-        default="/home/user/sjw/Yolo_pointrend/transfiner",
+        default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "transfiner")),
         help="Mask Transfiner 项目根目录（用于子进程评测，避免 detectron2 包冲突）。",
     )
     p.add_argument(

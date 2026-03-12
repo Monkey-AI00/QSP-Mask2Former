@@ -579,7 +579,12 @@ def _write_ply_xyzrgb_ascii(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> Non
 
 def main():
     parser = argparse.ArgumentParser(description="Mech-Eye Live -> PointRend -> Mask -> PointCloud")
-    parser.add_argument("--config-file", default="/home/user/sjw/Yolo_pointrend/detectron2/projects/PointRend/configs/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_plug.yaml")
+    parser.add_argument(
+        "--config-file",
+        default=os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "configs", "InstanceSegmentation", "pointrend_rcnn_R_50_FPN_3x_plug.yaml")
+        ),
+    )
     parser.add_argument("--weights", required=True, help="PointRend 权重路径")
     parser.add_argument("--score-thresh", type=float, default=0.5)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")

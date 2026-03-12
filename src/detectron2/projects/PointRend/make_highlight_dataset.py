@@ -12,9 +12,9 @@
 
 示例：
   PYTHONPATH=... conda run -n pointrend python make_highlight_dataset.py \
-    --in-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1 \
+    --in-root /home/users1/sjw/cursor/workspace/datasets/plug_train1 \
     --json-file plug_train.json \
-    --out-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1_highlight \
+    --out-root /home/users1/sjw/cursor/workspace/datasets/plug_train1_highlight \
     --prob 1.0 --focus object --clip --dilate 20
 """
 

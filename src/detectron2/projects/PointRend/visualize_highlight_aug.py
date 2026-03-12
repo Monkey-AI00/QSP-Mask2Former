@@ -11,9 +11,9 @@
 
 示例：
   PYTHONPATH=... conda run -n pointrend python visualize_highlight_aug.py \
-    --dataset-root /home/user/sjw/Yolo_pointrend/detectron2/plug_train1 \
+    --dataset-root /home/users1/sjw/cursor/workspace/datasets/plug_train1 \
     --json-file plug_train.json \
-    --out-dir ./output/highlight_vis \
+    --out-dir /home/users1/sjw/cursor/workspace/outputs/output/highlight_vis \
     --num 8 --seed 0 --prob 0.8
 """
 

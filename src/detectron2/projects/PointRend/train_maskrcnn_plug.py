@@ -42,7 +42,9 @@ warnings.filterwarnings(
 )
 
 # 添加 detectron2 到路径（必须指向 detectron2 仓库根目录）
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+_D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", ".."))
+sys.path.insert(0, _D2_ROOT)
 
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, launch
@@ -230,7 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu-id", type=int, default=None, help="指定使用的 GPU ID")
     parser.add_argument(
         "--dataset-root",
-        default="/home/user/sjw/Yolo_pointrend/detectron2/plug_train1",
+        default=os.path.join(_WORKSPACE_ROOT, "datasets", "plug_train1"),
         help="数据集目录（包含图片与 COCO json）",
     )
     parser.add_argument("--dataset-name", default="plug_train1", help="注册到 detectron2 的数据集名称")

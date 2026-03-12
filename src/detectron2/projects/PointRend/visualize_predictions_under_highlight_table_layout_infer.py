@@ -34,10 +34,12 @@ from detectron2.engine import DefaultPredictor
 from detectron2.projects.point_rend import add_pointrend_config
 
 # 触发注册：ShapeAwareCoarseMaskHead（如果用户传了 SPG 权重）
+_CUSTOM_HEADS_IMPORT_ERROR: Optional[Exception] = None
 try:
     import custom_heads  # noqa: F401
-except Exception:
+except Exception as e:
     custom_heads = None  # type: ignore
+    _CUSTOM_HEADS_IMPORT_ERROR = e
 
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*torch\.load.*weights_only=False.*")
@@ -302,6 +304,10 @@ def _build_pointrend_predictor(
     num_classes: int,
     score_thr: float,
 ) -> DefaultPredictor:
+    if str(mask_head_name).strip() == "ShapeAwareCoarseMaskHead" and _CUSTOM_HEADS_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "failed to import custom_heads, so ShapeAwareCoarseMaskHead was not registered"
+        ) from _CUSTOM_HEADS_IMPORT_ERROR
     cfg = get_cfg()
     add_pointrend_config(cfg)
     cfg.merge_from_file(config_file)
