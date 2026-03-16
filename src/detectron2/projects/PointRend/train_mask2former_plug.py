@@ -99,8 +99,8 @@ def setup(args):
 
     cfg.defrost()
     # 数据集与类别数：由 register_plug_dataset 决定
-    cfg.DATASETS.TRAIN = (str(args.dataset_name),)
-    cfg.DATASETS.TEST = (str(args.dataset_name),)
+    cfg.DATASETS.TRAIN = (str(args.train_dataset_name),)
+    cfg.DATASETS.TEST = (str(args.val_dataset_name),)
     # Mask2Former instance config 用 SEM_SEG_HEAD.NUM_CLASSES 表示 thing 类别数（COCO=80）
     cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES = int(args.num_classes)
 
@@ -133,7 +133,12 @@ def setup(args):
     # 训练前打印关键信息
     print("=" * 70)
     print("[mask2former][setup] config_file:", str(args.config_file))
-    print("[mask2former][setup] dataset_name:", str(args.dataset_name))
+    print("[mask2former][setup] train_dataset_name:", str(args.train_dataset_name))
+    print("[mask2former][setup] val_dataset_name:", str(args.val_dataset_name))
+    print("[mask2former][setup] train_dataset_root:", str(args.train_dataset_root))
+    print("[mask2former][setup] val_dataset_root:", str(args.val_dataset_root))
+    print("[mask2former][setup] train_json_file:", str(args.train_json_file))
+    print("[mask2former][setup] val_json_file:", str(args.val_json_file))
     print("[mask2former][setup] num_classes:", int(args.num_classes))
     print("[mask2former][setup] device:", str(cfg.MODEL.DEVICE))
     print("[mask2former][setup] backbone:", str(getattr(cfg.MODEL.BACKBONE, "NAME", "")))
@@ -158,10 +163,32 @@ def setup(args):
 
 
 def main(args):
-    # 注册数据集（复用你已有逻辑）
-    dataset_name, num_classes = register_plug_dataset(args.dataset_root, args.dataset_name, args.json_file)
-    args.dataset_name = dataset_name
-    args.num_classes = num_classes
+    # 注册训练集
+    train_dataset_name, train_num_classes = register_plug_dataset(
+        args.train_dataset_root,
+        args.train_dataset_name,
+        args.train_json_file,
+    )
+    args.train_dataset_name = train_dataset_name
+
+    # 注册验证集；若未显式提供，则回退到训练集
+    val_dataset_root = str(getattr(args, "val_dataset_root", "")).strip() or str(args.train_dataset_root)
+    val_dataset_name = str(getattr(args, "val_dataset_name", "")).strip() or f"{train_dataset_name}_val"
+    val_json_file = str(getattr(args, "val_json_file", "")).strip() or str(args.train_json_file)
+    val_dataset_name, val_num_classes = register_plug_dataset(
+        val_dataset_root,
+        val_dataset_name,
+        val_json_file,
+    )
+    args.val_dataset_root = val_dataset_root
+    args.val_dataset_name = val_dataset_name
+    args.val_json_file = val_json_file
+
+    if int(train_num_classes) != int(val_num_classes):
+        raise ValueError(
+            f"Train/val num_classes mismatch: train={train_num_classes}, val={val_num_classes}"
+        )
+    args.num_classes = train_num_classes
 
     cfg = setup(args)
 
@@ -179,13 +206,31 @@ def main(args):
 if __name__ == "__main__":
     parser = default_argument_parser()
     parser.add_argument("--gpu-id", type=int, default=None, help="指定使用的 GPU ID")
-    parser.add_argument("--dataset-root", default=os.path.join(_WORKSPACE_ROOT, "datasets", "plug_train1"))
-    parser.add_argument("--dataset-name", default="plug_train1")
-    parser.add_argument("--json-file", default="plug_train.json")
+    parser.add_argument(
+        "--train-dataset-root",
+        default=os.path.join(_WORKSPACE_ROOT, "datasets", "plug_train1"),
+        help="训练集目录（包含图片与 COCO json）",
+    )
+    parser.add_argument("--train-dataset-name", default="plug_train1", help="训练集注册名称")
+    parser.add_argument("--train-json-file", default="plug_train.json", help="训练集 COCO 标注文件名")
+    parser.add_argument("--val-dataset-root", default="", help="验证集目录（留空则回退到训练集目录）")
+    parser.add_argument("--val-dataset-name", default="", help="验证集注册名称（留空则自动生成）")
+    parser.add_argument("--val-json-file", default="", help="验证集 COCO 标注文件名（留空则回退到训练集 json）")
+    # 向后兼容旧参数名：若提供则覆盖 train 参数
+    parser.add_argument("--dataset-root", default="", help="(兼容) 等价于 --train-dataset-root")
+    parser.add_argument("--dataset-name", default="", help="(兼容) 等价于 --train-dataset-name")
+    parser.add_argument("--json-file", default="", help="(兼容) 等价于 --train-json-file")
     parser.add_argument("--weights", default="", help="初始化权重（建议用 Mask2Former COCO instance 预训练）")
     parser.add_argument("--output-dir", default="", help="训练输出目录")
 
     args = parser.parse_args()
+
+    if str(getattr(args, "dataset_root", "")).strip():
+        args.train_dataset_root = str(args.dataset_root).strip()
+    if str(getattr(args, "dataset_name", "")).strip():
+        args.train_dataset_name = str(args.dataset_name).strip()
+    if str(getattr(args, "json_file", "")).strip():
+        args.train_json_file = str(args.json_file).strip()
 
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
