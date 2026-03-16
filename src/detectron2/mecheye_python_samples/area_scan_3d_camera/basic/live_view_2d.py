@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -40,6 +41,16 @@ def _print_camera_info_fallback(ci: Any) -> None:
     model = getattr(ci, "model", None)
     fw = getattr(ci, "firmware_version", None)
     print(f"  ip_address={ip} serial_number={sn} model={model} firmware={fw}")
+
+
+def _save_frame(img2d: Any, save_dir: str, save_idx: int) -> str:
+    from datetime import datetime
+
+    os.makedirs(save_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out = os.path.join(save_dir, f"save{int(save_idx)}_{ts}.png")
+    cv2.imwrite(out, img2d)
+    return out
 
 
 def discover_and_print_cameras() -> list:
@@ -109,7 +120,7 @@ def main():
     parser.add_argument("--index", type=int, default=-1, help="按 discover_cameras 的索引连接（默认 0）")
     parser.add_argument("--win", default="Mech-Eye 2D Live", help="窗口标题")
     parser.add_argument("--wait", type=int, default=1, help="cv2.waitKey 等待毫秒数（越小越流畅）")
-    parser.add_argument("--save", default="", help="可选：保存每帧到该目录（用于离线调试/喂给 PointRend）")
+    parser.add_argument("--save", default="", help="可选：保存目录。按 s 保存当前帧；不再自动逐帧保存。")
     args = parser.parse_args()
 
     camera = Camera()
@@ -123,14 +134,12 @@ def main():
     try:
         save_dir = str(args.save).strip()
         if save_dir:
-            import os
-            from datetime import datetime
-
             os.makedirs(save_dir, exist_ok=True)
 
         frame_2d = Frame2D()
-        print("开始实时预览：按 'q' 退出。")
+        print("开始实时预览：按 'q' 退出，按 's' 保存当前帧。")
         idx = 0
+        save_count = 0
         while True:
             idx += 1
             st = camera.capture_2d(frame_2d)
@@ -146,15 +155,13 @@ def main():
 
             cv2.imshow(str(args.win), img2d)
 
-            if save_dir:
-                # 保存为 png：确保你后续 PointRend 用的就是这帧
-                from datetime import datetime
-
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                out = f"{save_dir}/mecheye_2d_{ts}.png"
-                cv2.imwrite(out, img2d)
-
             k = cv2.waitKey(int(args.wait)) & 0xFF
+            if k == ord("s"):
+                target_dir = save_dir or os.path.abspath("./captures")
+                save_count += 1
+                out = _save_frame(img2d, target_dir, save_count)
+                print(f"已保存第{save_count}张: {out}")
+                continue
             if k == ord("q"):
                 break
     finally:

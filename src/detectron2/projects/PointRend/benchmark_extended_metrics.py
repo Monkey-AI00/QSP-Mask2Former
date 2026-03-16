@@ -153,6 +153,7 @@ def _write_table1_latex(
         ("MaskTransfiner", "MaskTransfiner"),
     ]
     geometry_aware = [
+        ("Mask2Former+QSP", "M2F + QSP"),
         ("Mask2Former+GeoLoss", "M2F + Geo.Loss"),
         ("Mask2Former+SDF", "M2F + SDF"),
         ("PRIOR", "Ours"),
@@ -227,6 +228,7 @@ def _write_table1_markdown(
             ("MaskTransfiner", "MaskTransfiner"),
         ]),
         ("Geometry-aware", [
+            ("Mask2Former+QSP", "M2F + QSP"),
             ("Mask2Former+GeoLoss", "M2F + Geo.Loss"),
             ("Mask2Former+SDF", "M2F + SDF"),
             ("PRIOR", "Ours"),
@@ -280,6 +282,11 @@ def parse_args() -> argparse.Namespace:
         help="Mask2Former 的 config yaml（例如 detectron2/projects/PointRend/configs/InstanceSegmentation/mask2former_R50_plug.yaml）",
     )
     p.add_argument(
+        "--config-file-mask2former-qsp",
+        default="",
+        help="Mask2Former+QSP 的 config yaml（可选；未提供时回退到 --config-file-mask2former）。",
+    )
+    p.add_argument(
         "--transfiner-root",
         default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "transfiner")),
         help="Mask Transfiner 项目根目录（用于子进程评测，避免 detectron2 包冲突）。",
@@ -307,8 +314,18 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Mask2Former(+Geo.Loss) 训练好的权重路径（可选；用于表1 Geometry-aware: M2F + Geo.Loss）。",
     )
+    p.add_argument(
+        "--weights-mask2former-qsp",
+        default="",
+        help="Mask2Former(+QSP) 训练好的权重路径（可选；用于表1 Geometry-aware: M2F + QSP）。",
+    )
     p.add_argument("--weights-transfiner", default="", help="Mask Transfiner 训练好的权重路径（model_final.pth）")
-    p.add_argument("--shape-prior-npy", default="")
+    p.add_argument("--shape-prior-npy", default="", help="PointRend 的 ShapePrior(.npy) 路径，仅供 --weights-prior 使用。")
+    p.add_argument(
+        "--prior-path-mask2former-qsp",
+        default="",
+        help="Mask2Former+QSP 的 PRIOR_PATH 覆盖路径，独立于 --shape-prior-npy。",
+    )
     p.add_argument("--score-thr", type=float, default=0.5)
 
     p.add_argument("--severities", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0])
@@ -608,6 +625,7 @@ def _build_cfg_mask2former(
     num_classes: int,
     score_thr: float,
     dataset_test_name: str,
+    prior_path_override: str = "",
 ) -> "CfgNode":
     """
     Mask2Former 的 cfg 构建（按 Mask2Former/train_net.py 的做法）：
@@ -641,6 +659,9 @@ def _build_cfg_mask2former(
     cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = True
     # 对齐阈值
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = float(score_thr)
+    if str(prior_path_override).strip():
+        cfg.MODEL.MASK_FORMER.PRIOR_ON = True
+        cfg.MODEL.MASK_FORMER.PRIOR_PATH = str(prior_path_override).strip()
     cfg.freeze()
     return cfg
 
@@ -925,6 +946,25 @@ def main() -> None:
                 "config": os.path.abspath(str(args.config_file_mask2former).strip()),
             }
         )
+    if str(getattr(args, "weights_mask2former_qsp", "")).strip():
+        config_mask2former_qsp = str(getattr(args, "config_file_mask2former_qsp", "")).strip() or str(
+            getattr(args, "config_file_mask2former", "")
+        ).strip()
+        if not config_mask2former_qsp:
+            raise ValueError(
+                "提供 --weights-mask2former-qsp 时必须同时提供 --config-file-mask2former-qsp 或 --config-file-mask2former"
+            )
+        methods.append(
+            {
+                "method": "Mask2Former+QSP",
+                "kind": "mask2former",
+                "weights": os.path.abspath(str(args.weights_mask2former_qsp).strip()),
+                "config": os.path.abspath(config_mask2former_qsp),
+                "prior_path": os.path.abspath(str(args.prior_path_mask2former_qsp).strip())
+                if str(getattr(args, "prior_path_mask2former_qsp", "")).strip()
+                else "",
+            }
+        )
     if str(getattr(args, "weights_mask2former_geoloss", "")).strip():
         if not str(getattr(args, "config_file_mask2former", "")).strip():
             raise ValueError("提供 --weights-mask2former-geoloss 时必须同时提供 --config-file-mask2former")
@@ -975,6 +1015,7 @@ def main() -> None:
                     num_classes=num_classes,
                     score_thr=args.score_thr,
                     dataset_test_name=dataset_name,
+                    prior_path_override=str(m.get("prior_path", "")),
                 )
             elif kind == "transfiner":
                 # 子进程评测（避免 detectron2 包冲突）
@@ -1061,6 +1102,7 @@ def main() -> None:
                     num_classes=num_classes,
                     score_thr=args.score_thr,
                     dataset_test_name=speed_dataset_name,
+                    prior_path_override=str(m.get("prior_path", "")),
                 )
             elif kind == "transfiner":
                 # transfiner 与主工程 detectron2 存在包冲突，精确速度评测需要在 transfiner 子进程内完成。

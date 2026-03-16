@@ -21,7 +21,7 @@ from detectron2.data import DatasetMapper, build_detection_train_loader
 
 
 def load_plug_json(json_file, image_root, dataset_name):
-    """自定义加载函数，过滤掉 _background_ 类别"""
+    """自定义加载函数，过滤掉 _background_ 和空类别。"""
     from detectron2.data.datasets.coco import load_coco_json
     import json
     
@@ -29,18 +29,20 @@ def load_plug_json(json_file, image_root, dataset_name):
     with open(json_file, 'r') as f:
         coco_data = json.load(f)
     
-    # 获取所有类别，过滤掉 _background_
+    # 获取所有类别，过滤掉 _background_ 和空类别名
     all_categories = sorted(coco_data['categories'], key=lambda x: x['id'])
-    thing_classes = [cat['name'] for cat in all_categories if cat['name'] != '_background_']
+    valid_categories = [
+        cat for cat in all_categories
+        if str(cat.get('name', '')).strip() and cat.get('name') != '_background_'
+    ]
+    thing_classes = [cat['name'] for cat in valid_categories]
     
-    # 创建类别 ID 映射（原始 ID -> 新的连续 ID，排除 _background_）
-    # 例如：如果原始有 {0: _background_, 1: plug}，新映射应该是 {1: 0} (plug 映射到 0)
+    # 创建类别 ID 映射（原始 ID -> 新的连续 ID，排除 _background_ 和空类别）
     thing_dataset_id_to_contiguous_id = {}
     new_idx = 0
-    for cat in all_categories:
-        if cat['name'] != '_background_':
-            thing_dataset_id_to_contiguous_id[cat['id']] = new_idx
-            new_idx += 1
+    for cat in valid_categories:
+        thing_dataset_id_to_contiguous_id[cat['id']] = new_idx
+        new_idx += 1
     
     # 使用 dataset_name=None 调用 load_coco_json，这样它不会设置元数据
     dataset_dicts = load_coco_json(json_file, image_root, dataset_name=None)
@@ -50,13 +52,13 @@ def load_plug_json(json_file, image_root, dataset_name):
     metadata.__dict__['thing_classes'] = thing_classes
     metadata.__dict__['thing_dataset_id_to_contiguous_id'] = thing_dataset_id_to_contiguous_id
     
-    # 过滤数据集中的标注：移除 _background_ 类别的标注，并更新类别 ID
+    # 过滤数据集中的标注：移除无效类别标注，并更新类别 ID
     filtered_dicts = []
     for dataset_dict in dataset_dicts:
         filtered_anns = []
         for ann in dataset_dict.get("annotations", []):
             orig_cat_id = ann["category_id"]
-            # 只保留在映射中的类别（即非 _background_）
+            # 只保留在映射中的类别（即有效前景类别）
             if orig_cat_id in thing_dataset_id_to_contiguous_id:
                 ann["category_id"] = thing_dataset_id_to_contiguous_id[orig_cat_id]
                 filtered_anns.append(ann)
@@ -68,18 +70,15 @@ def load_plug_json(json_file, image_root, dataset_name):
     return filtered_dicts
 
 
-def register_plug_dataset():
-    """注册 plug 数据集"""
-    # ============================================
-    # 📁 数据输入路径配置
-    # ============================================
-    dataset_root = "/home/users1/sjw/cursor/Yolo_pointrend/plug_train"
-    json_file = os.path.join(dataset_root, "plug_train.json")
+def register_plug_dataset(dataset_root=None, dataset_name="plug_train", json_filename="plug_train.json"):
+    """注册 plug 数据集，返回 `(dataset_name, num_classes)`。"""
+    if dataset_root is None:
+        dataset_root = "/home/users1/sjw/cursor/Yolo_pointrend/plug_train"
+
+    dataset_root = os.path.abspath(str(dataset_root))
+    json_file = os.path.join(dataset_root, str(json_filename))
     image_root = dataset_root
-    
-    # 数据集名称
-    dataset_name = "plug_train"
-    
+
     # 检查文件是否存在
     if not os.path.exists(json_file):
         raise FileNotFoundError(f"❌ 错误: 找不到 JSON 标注文件: {json_file}")
@@ -106,9 +105,9 @@ def register_plug_dataset():
         image_root,
     )
     
-    # 从临时数据集获取元数据（这会触发 load_coco_json 执行）
-    temp_metadata = MetadataCatalog.get(temp_dataset_name)
-    _ = DatasetCatalog.get(temp_dataset_name)  # 触发加载以设置元数据
+    # 触发一次加载，让 COCO 元数据初始化完成
+    _ = MetadataCatalog.get(temp_dataset_name)
+    _ = DatasetCatalog.get(temp_dataset_name)
     
     # 现在注册真正的数据集，使用自定义加载函数
     DatasetCatalog.register(dataset_name, lambda: load_plug_json(json_file, image_root, dataset_name))
@@ -126,6 +125,7 @@ def register_plug_dataset():
     
     # 获取更新后的元数据
     metadata = MetadataCatalog.get(dataset_name)
+    num_classes = len(getattr(metadata, "thing_classes", []))
     num_images = len(dataset_dicts)
     num_annotations = sum(len(d.get("annotations", [])) for d in dataset_dicts)
     
@@ -137,10 +137,11 @@ def register_plug_dataset():
     
     print(f"✓ 数据集 {dataset_name} 注册成功")
     print(f"  - 类别: {metadata.thing_classes}")
+    print(f"  - 类别数: {num_classes}")
     print(f"  - 图片数量: {num_images}")
     print(f"  - 标注数量: {num_annotations}")
     
-    return dataset_name
+    return dataset_name, num_classes
 
 
 class Trainer(DefaultTrainer):
