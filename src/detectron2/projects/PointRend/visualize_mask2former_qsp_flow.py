@@ -6,7 +6,7 @@
 - Input Image
 - Raw Mask Logits (pred_masks_raw)
 - Aligned Prior (pred_prior_masks)
-- Prior Gate (pred_prior_gates，当前为 spatial gate map)
+- Effective Gate (pred_prior_gates，已融合 occluder 抑制后的有效 gate)
 - Occluder Suppression (pred_prior_occluders，可视化线缆/遮挡抑制区域)
 - Fused Mask Logits (pred_masks)
 - Final Output Overlay
@@ -27,7 +27,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 _D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _D2_ROOT not in sys.path:
@@ -155,22 +155,306 @@ def _build_cfg(config_file: str, weights: str, score_thr: float, prior_path: str
 
 
 def _save_tensor_heat(name: str, arr01: np.ndarray, out_dir: str, max_side: int) -> None:
+    _imwrite(os.path.join(out_dir, name), _render_tensor_heat(arr01, max_side))
+
+
+def _save_tensor_heat_norm(name: str, arr: np.ndarray, out_dir: str, max_side: int) -> None:
+    _imwrite(os.path.join(out_dir, name), _render_tensor_heat_norm(arr, max_side))
+
+
+def _save_signed_heat(name: str, arr: np.ndarray, out_dir: str, max_side: int) -> None:
+    _imwrite(os.path.join(out_dir, name), _render_signed_heat(arr, max_side))
+
+
+def _render_tensor_heat(arr01: np.ndarray, max_side: int) -> np.ndarray:
     gray = _to_u8_heat(arr01)
     colored = _colormap_jet(gray)
-    colored = _resize_to(colored, (max_side, max_side))
-    _imwrite(os.path.join(out_dir, name), colored)
+    return _resize_to(colored, (max_side, max_side))
+
+
+def _render_tensor_heat_norm(arr: np.ndarray, max_side: int) -> np.ndarray:
+    return _render_tensor_heat(_norm01(arr), max_side)
+
+
+def _render_signed_heat(arr: np.ndarray, max_side: int) -> np.ndarray:
+    x = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    vmax = float(np.max(np.abs(x)))
+    if (not np.isfinite(vmax)) or vmax < 1e-8:
+        vis = np.full((*x.shape, 3), 255, dtype=np.uint8)
+    else:
+        z = np.clip(x / vmax, -1.0, 1.0)
+        vis = np.zeros((*z.shape, 3), dtype=np.uint8)
+
+        neg = z < 0
+        pos = ~neg
+
+        # BGR: negative -> blue, zero -> white, positive -> red
+        t_neg = z[neg] + 1.0
+        vis[..., 0][neg] = 255
+        vis[..., 1][neg] = np.round(255.0 * t_neg).astype(np.uint8)
+        vis[..., 2][neg] = np.round(255.0 * t_neg).astype(np.uint8)
+
+        t_pos = z[pos]
+        vis[..., 0][pos] = np.round(255.0 * (1.0 - t_pos)).astype(np.uint8)
+        vis[..., 1][pos] = np.round(255.0 * (1.0 - t_pos)).astype(np.uint8)
+        vis[..., 2][pos] = 255
+
+    return _resize_to(vis, (max_side, max_side))
 
 
 def _save_tensor_gray(name: str, arr01: np.ndarray, out_dir: str, max_side: int) -> None:
-    gray = _to_u8_heat(arr01)
-    gray = _resize_to(gray, (max_side, max_side))
-    _imwrite(os.path.join(out_dir, name), gray)
+    _imwrite(os.path.join(out_dir, name), _render_tensor_gray(arr01, max_side))
 
 
 def _save_binary_mask(name: str, mask01: np.ndarray, out_dir: str, max_side: int) -> None:
+    _imwrite(os.path.join(out_dir, name), _render_binary_mask(mask01, max_side))
+
+
+def _render_tensor_gray(arr01: np.ndarray, max_side: int) -> np.ndarray:
+    gray = _to_u8_heat(arr01)
+    return _resize_to(gray, (max_side, max_side))
+
+
+def _render_binary_mask(mask01: np.ndarray, max_side: int) -> np.ndarray:
     mask_u8 = ((mask01 > 0.5).astype(np.uint8) * 255)
-    mask_u8 = _resize_to(mask_u8, (max_side, max_side))
-    _imwrite(os.path.join(out_dir, name), mask_u8)
+    return _resize_to(mask_u8, (max_side, max_side))
+
+
+def _bgr_to_pil_rgb(img: np.ndarray) -> Image.Image:
+    if img.ndim == 2:
+        rgb = np.repeat(img[:, :, None], 3, axis=2)
+    else:
+        rgb = img[:, :, ::-1]
+    return Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+
+
+def _fit_with_padding(img: np.ndarray, width: int, height: int, pad: int = 12) -> Image.Image:
+    src = _bgr_to_pil_rgb(img)
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    avail_w = max(1, width - 2 * pad)
+    avail_h = max(1, height - 2 * pad)
+    scale = min(avail_w / max(src.width, 1), avail_h / max(src.height, 1))
+    new_w = max(1, int(round(src.width * scale)))
+    new_h = max(1, int(round(src.height * scale)))
+    resized = src.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
+    offset = ((width - new_w) // 2, (height - new_h) // 2)
+    canvas.paste(resized, offset)
+    return canvas
+
+
+def _draw_centered_text(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], text: str, font, fill) -> None:
+    left, top, right, bottom = box
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = left + (right - left - text_w) / 2.0
+    y = top + (bottom - top - text_h) / 2.0
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _paste_labeled_tile(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    title: str,
+    img: np.ndarray,
+    tile_w: int,
+    tile_h: int,
+    title_h: int,
+    font,
+) -> tuple[int, int, int, int]:
+    outer = (x, y, x + tile_w, y + title_h + tile_h)
+    draw.rounded_rectangle(outer, radius=14, fill=(251, 252, 255), outline=(160, 170, 185), width=2)
+    _draw_centered_text(draw, (x + 6, y + 4, x + tile_w - 6, y + title_h), title, font, (18, 28, 45))
+    inner = _fit_with_padding(img, tile_w - 16, tile_h - 16, pad=8)
+    canvas.paste(inner, (x + 8, y + title_h + 8))
+    return outer
+
+
+def _draw_arrow(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    fill=(70, 80, 95),
+    width: int = 4,
+) -> None:
+    x1, y1 = start
+    x2, y2 = end
+    draw.line((x1, y1, x2, y2), fill=fill, width=width)
+    if x1 == x2 and y1 == y2:
+        return
+    dx = float(x2 - x1)
+    dy = float(y2 - y1)
+    norm = max((dx * dx + dy * dy) ** 0.5, 1.0)
+    ux = dx / norm
+    uy = dy / norm
+    px = -uy
+    py = ux
+    head_len = 14
+    head_w = 8
+    tip = (x2, y2)
+    left = (x2 - ux * head_len + px * head_w, y2 - uy * head_len + py * head_w)
+    right = (x2 - ux * head_len - px * head_w, y2 - uy * head_len - py * head_w)
+    draw.polygon([tip, left, right], fill=fill)
+
+
+def _save_dpc_flow_overview(
+    out_dir: str,
+    max_side: int,
+    img_bgr: np.ndarray,
+    raw_mask_prob: np.ndarray,
+    prior_mask_prob: np.ndarray,
+    occ_map: np.ndarray,
+    gate_map: np.ndarray,
+    residual_update: np.ndarray,
+    fused_mask_prob: np.ndarray,
+    overlay_bgr: np.ndarray,
+) -> None:
+    tile_img = max(128, min(int(max_side), 220))
+    tile_w = tile_img + 18
+    tile_h = tile_img + 18
+    title_h = 34
+    margin = 36
+    gap = 24
+    panel_gap = 90
+    flow_gap = 70
+    fusion_box_w = 126
+    fusion_box_h = 72
+    main_panel_w = 3 * tile_w + 2 * gap
+    canvas_w = margin * 2 + tile_w + flow_gap + main_panel_w + panel_gap + fusion_box_w + flow_gap + tile_w + flow_gap + tile_w
+    canvas_h = margin * 2 + title_h + 2 * tile_h + gap + 100
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (246, 248, 252))
+    draw = ImageDraw.Draw(canvas)
+    title_font = ImageFont.load_default()
+    text_font = ImageFont.load_default()
+
+    draw.text((margin, 12), "QSP + Mask2Former flow with occluder suppression", font=title_font, fill=(20, 28, 38))
+
+    input_y = margin + title_h + tile_h // 2
+    input_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        margin,
+        input_y,
+        "Input image",
+        _resize_to(img_bgr, (tile_img, tile_img)),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+
+    panel_x = margin + tile_w + flow_gap
+    panel_y = margin + 24
+    panel_box = (panel_x - 18, panel_y - 18, panel_x + main_panel_w + 18, panel_y + title_h + 2 * tile_h + gap + 18)
+    draw.rounded_rectangle(panel_box, radius=18, outline=(90, 110, 135), width=3, fill=(255, 255, 255))
+    draw.text((panel_x, panel_y - 34), "Dynamic Prior Correction (DPC)", font=title_font, fill=(24, 38, 58))
+
+    raw_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        panel_x,
+        panel_y,
+        "Raw mask logits",
+        _render_tensor_heat(raw_mask_prob, tile_img),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+    prior_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        panel_x + tile_w + gap,
+        panel_y,
+        "Aligned prior",
+        _render_tensor_heat(prior_mask_prob, tile_img),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+    occ_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        panel_x + 2 * (tile_w + gap),
+        panel_y,
+        "Occluder suppression",
+        _render_tensor_heat(occ_map, tile_img),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+    gate_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        panel_x + tile_w // 2,
+        panel_y + title_h + tile_h + gap,
+        "Effective gate",
+        _render_tensor_heat(gate_map, tile_img),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+    residual_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        panel_x + tile_w // 2 + tile_w + gap,
+        panel_y + title_h + tile_h + gap,
+        "Residual update",
+        _render_signed_heat(residual_update, tile_img),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+
+    fusion_x = panel_box[2] + panel_gap
+    fusion_y = margin + canvas_h // 2 - fusion_box_h // 2 - 6
+    fusion_box = (fusion_x, fusion_y, fusion_x + fusion_box_w, fusion_y + fusion_box_h)
+    draw.rounded_rectangle(fusion_box, radius=16, fill=(225, 236, 248), outline=(110, 135, 165), width=3)
+    _draw_centered_text(draw, fusion_box, "Prior fusion", title_font, (24, 44, 72))
+
+    fused_x = fusion_box[2] + flow_gap
+    fused_y = input_y
+    fused_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        fused_x,
+        fused_y,
+        "Fused mask",
+        _render_tensor_heat(fused_mask_prob, tile_img),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+    final_x = fused_box[2] + flow_gap
+    final_box = _paste_labeled_tile(
+        canvas,
+        draw,
+        final_x,
+        fused_y,
+        "Final output",
+        _resize_to(overlay_bgr, (tile_img, tile_img)),
+        tile_w,
+        tile_h,
+        title_h,
+        text_font,
+    )
+
+    dpc_center = (fusion_box[0], (fusion_box[1] + fusion_box[3]) // 2)
+    for box in (raw_box, prior_box, occ_box, gate_box, residual_box):
+        _draw_arrow(draw, (box[2], (box[1] + box[3]) // 2), dpc_center)
+    _draw_arrow(draw, (input_box[2], (input_box[1] + input_box[3]) // 2), (raw_box[0] - 18, (raw_box[1] + raw_box[3]) // 2))
+    _draw_arrow(draw, (fusion_box[2], (fusion_box[1] + fusion_box[3]) // 2), (fused_box[0] - 18, (fused_box[1] + fused_box[3]) // 2))
+    _draw_arrow(draw, (fused_box[2], (fused_box[1] + fused_box[3]) // 2), (final_box[0] - 18, (final_box[1] + final_box[3]) // 2))
+
+    canvas.save(os.path.join(out_dir, "dpc_flow_overview.png"))
 
 
 def _make_affine_grid_prior(h: int, w: int) -> np.ndarray:
@@ -340,7 +624,10 @@ def main() -> None:
             raw_mask_logits = raw_mask_result[q_idx].detach().float().cpu().numpy()
             raw_mask_prob = _sigmoid(raw_mask_logits)
         else:
+            raw_mask_logits = fused_mask_logits.copy()
             raw_mask_prob = fused_mask_prob
+
+        residual_update = fused_mask_logits - raw_mask_logits
 
         if prior_mask_results is not None:
             prior_mask_result = sem_seg_postprocess(prior_mask_results[0], image_size, height, width)
@@ -424,7 +711,10 @@ def main() -> None:
     _save_tensor_heat("mask_features.png", mask_features_map, args.out_dir, max_side)
     _save_tensor_heat("aligned_prior.png", prior_mask_prob, args.out_dir, max_side)
     _save_tensor_heat("prior_gate.png", gate_map, args.out_dir, max_side)
-    _save_tensor_heat("prior_occluder.png", occ_map, args.out_dir, max_side)
+    _save_tensor_heat("effective_gate.png", gate_map, args.out_dir, max_side)
+    _save_tensor_heat("prior_occluder_abs.png", occ_map, args.out_dir, max_side)
+    _save_tensor_heat_norm("prior_occluder.png", occ_map, args.out_dir, max_side)
+    _save_signed_heat("residual_update.png", residual_update, args.out_dir, max_side)
     _save_tensor_heat("fused_mask.png", fused_mask_prob, args.out_dir, max_side)
     if selected_prior is not None:
         _save_tensor_gray("selected_prior.png", np.clip(selected_prior, 0.0, 1.0), args.out_dir, max_side)
@@ -434,6 +724,18 @@ def main() -> None:
     _imwrite(os.path.join(args.out_dir, "final_mask.png"), (final_mask * 255).astype(np.uint8))
     overlay = _overlay_mask(img_bgr, final_mask.astype(np.float32), color_bgr=(0, 255, 0), alpha=0.45)
     _imwrite(os.path.join(args.out_dir, "final_overlay.png"), overlay)
+    _save_dpc_flow_overview(
+        args.out_dir,
+        max_side,
+        img_bgr,
+        raw_mask_prob,
+        prior_mask_prob,
+        occ_map,
+        gate_map,
+        residual_update,
+        fused_mask_prob,
+        overlay,
+    )
 
     with open(os.path.join(args.out_dir, "affine_params.txt"), "w", encoding="utf-8") as f:
         f.write(f"query_idx={q_idx}\n")
@@ -458,7 +760,12 @@ def main() -> None:
         f.write(f"query_idx={q_idx}\n")
         f.write(f"instance_score={best_score}\n")
         f.write(f"gate_mean={gate_mean}\n")
+        f.write("pred_prior_gates_semantics=effective_gate_after_occluder_suppression\n")
         f.write(f"occluder_mean={occ_mean}\n")
+        f.write("prior_occluder_png_semantics=normalized_for_visual_contrast\n")
+        f.write("prior_occluder_abs_png_semantics=absolute_occluder_probability\n")
+        f.write(f"residual_update_mean={float(np.mean(residual_update))}\n")
+        f.write(f"residual_update_absmax={float(np.max(np.abs(residual_update)))}\n")
         f.write(f"selected_bank_idx={selected_bank_idx}\n")
         if prior_bank_weight_results is not None:
             bank_weights = prior_bank_weight_results[0, q_idx].detach().float().cpu().numpy().tolist()
