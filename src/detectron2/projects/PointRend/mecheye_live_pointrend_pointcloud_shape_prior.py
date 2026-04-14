@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Mech-Eye 实时预览 + PointRend 实例分割（Shape Prior 版）+ 同帧生成 3D 点云（PLY）
+Mech-Eye 实时预览 + 实例分割 + 同帧生成 3D 点云（PLY）
 
-本脚本基于 `mecheye_live_pointrend_pointcloud.py`，主要新增：
-1) 启用 Shape Prior：`cfg.MODEL.ROI_MASK_HEAD.NAME = "ShapeAwareCoarseMaskHead"`
-2) 支持通过 `--shape-prior-npy` 设置 `SHAPE_PRIOR_PATH`（或走 `custom_heads.py` 的默认 prior 路径）
-3) `import custom_heads` 触发 detectron2 registry 注册（否则找不到 ShapeAwareCoarseMaskHead）
+当前脚本同时支持两套推理后端：
+1) PointRend / PointRend + Shape Prior
+2) Mask2Former / Mask2Former + QSP
 
 目标（同一帧闭环，避免错位）：
 1) Mech-Eye: capture_2d_and_3d() -> color + depth
-2) PointRend(+ShapePrior): 对 color 推理，生成二值 mask（前景=255，背景=0）
+2) 实例分割模型对 color 推理，生成二值 mask（前景=255，背景=0）
 3) Mech-Eye SDK: get_point_cloud_after_mapping(depth, mask, color, intrinsics, points_xyz_bgr)
 
 交互：
@@ -36,11 +35,20 @@ import numpy as np
 import torch
 
 # 添加 detectron2 到路径（脚本位于 detectron2/projects/PointRend 下）
-# 注意：需要把 sys.path 指到 “detectron2 仓库根目录”（包含 detectron2/ 这个 python 包的那个目录），
-# 也就是本脚本的上两级目录：detectron2/projects/PointRend -> detectron2
 _D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _D2_ROOT not in sys.path:
     sys.path.insert(0, _D2_ROOT)
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", ".."))
+_DEFAULT_MASK2FORMER_ROOT = os.path.abspath(os.path.join(_WORKSPACE_ROOT, "..", "Mask2Former"))
+_DEFAULT_POINTREND_CONFIG = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "configs", "InstanceSegmentation", "pointrend_rcnn_R_50_FPN_3x_plug.yaml")
+)
+_DEFAULT_MASK2FORMER_BASE_CONFIG = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "configs", "InstanceSegmentation", "mask2former_R50_plug.yaml")
+)
+_DEFAULT_MASK2FORMER_QSP_CONFIG = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "configs", "InstanceSegmentation", "mask2former_R50_plug_qsp_aug.yaml")
+)
 
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
@@ -145,7 +153,21 @@ def connect_camera(camera: "Camera", *, ip: str = "", serial: str = "", index: i
     return True
 
 
-def build_predictor(
+def _add_mask2former_to_syspath(mask2former_root: str) -> str:
+    root = os.path.abspath(str(mask2former_root))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return root
+
+
+def _require_existing_file(path: str, label: str) -> str:
+    p = os.path.abspath(str(path))
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"{label} not found: {p}")
+    return p
+
+
+def build_pointrend_predictor(
     *,
     config_file: str,
     weights: str,
@@ -170,6 +192,49 @@ def build_predictor(
 
     predictor = DefaultPredictor(cfg)
     # 显式 load 一次（DefaultPredictor 内部也会 load，但这里确保日志更直观/与 visualize 脚本一致）
+    DetectionCheckpointer(predictor.model).load(weights)
+    predictor.model.eval()
+    return predictor
+
+
+def build_mask2former_predictor(
+    *,
+    mask2former_root: str,
+    config_file: str,
+    weights: str,
+    score_thresh: float,
+    device: str,
+    num_classes: int = 1,
+    prior_path_override: str = "",
+) -> DefaultPredictor:
+    _add_mask2former_to_syspath(mask2former_root)
+
+    # 显式 import 以触发 Mask2Former 注册（meta arch / dataset mapper / decoder 等）。
+    import mask2former as _mask2former  # noqa: F401  # type: ignore
+
+    from detectron2.projects.deeplab import add_deeplab_config
+    from mask2former import add_maskformer2_config  # type: ignore
+
+    cfg = get_cfg()
+    add_deeplab_config(cfg)
+    add_maskformer2_config(cfg)
+    cfg.merge_from_file(config_file)
+
+    cfg.defrost()
+    cfg.MODEL.WEIGHTS = weights
+    cfg.MODEL.DEVICE = device
+    cfg.DATALOADER.NUM_WORKERS = 0
+    cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES = int(num_classes)
+    cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = True
+    cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = float(score_thresh)
+    if str(prior_path_override).strip():
+        cfg.MODEL.MASK_FORMER.PRIOR_ON = True
+        cfg.MODEL.MASK_FORMER.PRIOR_PATH = str(prior_path_override).strip()
+    cfg.freeze()
+
+    predictor = DefaultPredictor(cfg)
     DetectionCheckpointer(predictor.model).load(weights)
     predictor.model.eval()
     return predictor
@@ -326,6 +391,68 @@ def _mask_fg_ratio(mask_u8: np.ndarray) -> float:
         return 0.0
     fg = float(np.count_nonzero(m > 0))
     return fg / total
+
+
+def _overlay_binary_mask(
+    img_bgr: np.ndarray,
+    mask_u8: np.ndarray,
+    *,
+    color_bgr: tuple[int, int, int] = (80, 210, 160),
+    alpha: float = 0.35,
+    outline: bool = True,
+) -> np.ndarray:
+    out = img_bgr.copy()
+    if mask_u8 is None or mask_u8.size == 0:
+        return out
+    m = (mask_u8 > 0).astype(np.uint8)
+    if not np.any(m):
+        return out
+    color = np.array(color_bgr, dtype=np.float32).reshape(1, 1, 3)
+    out_f = out.astype(np.float32)
+    sel = m.astype(bool)
+    out_f[sel] = out_f[sel] * (1.0 - float(alpha)) + color * float(alpha)
+    out = np.clip(out_f, 0, 255).astype(np.uint8)
+    if outline:
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, tuple(int(c) for c in color_bgr), 2, cv2.LINE_AA)
+    return out
+
+
+def _build_output_masks(
+    instances,
+    *,
+    mask_mode: str,
+    pc_mask_mode: str,
+    pc_iou_thresh: float,
+    pc_join_dilate: int,
+    mask_close: int,
+    mask_dilate: int,
+    mask_erode: int,
+    invert_mask: bool,
+    auto_invert_mask: bool,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    mask_u8_vis = instances_to_binary_mask_u8(instances, mask_mode=mask_mode)  # type: ignore[arg-type]
+    mask_u8_vis = _morph_mask(mask_u8_vis, close=mask_close, dilate=mask_dilate, erode=mask_erode)
+    mask_u8_pc = instances_to_binary_mask_u8_pc(
+        instances,
+        pc_mask_mode=pc_mask_mode,  # type: ignore[arg-type]
+        iou_thresh=pc_iou_thresh,
+        join_dilate=pc_join_dilate,
+    )
+    mask_u8_pc = _morph_mask(mask_u8_pc, close=mask_close, dilate=mask_dilate, erode=mask_erode)
+
+    invert_applied = False
+    if invert_mask:
+        invert_applied = True
+    elif auto_invert_mask:
+        r0 = _mask_fg_ratio(mask_u8_pc)
+        r1 = _mask_fg_ratio(255 - mask_u8_pc)
+        invert_applied = r1 < r0
+
+    if invert_applied:
+        mask_u8_vis = 255 - mask_u8_vis
+        mask_u8_pc = 255 - mask_u8_pc
+    return mask_u8_vis, mask_u8_pc, invert_applied
 
 
 def mask_u8_to_sdk_grayscale2d(mask_u8: np.ndarray) -> "GrayScale2DImage":
@@ -595,17 +722,29 @@ def _write_ply_xyzrgb_ascii(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> Non
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Mech-Eye Live -> PointRend(ShapePrior) -> Mask -> PointCloud")
+    parser = argparse.ArgumentParser(description="Mech-Eye Live -> Instance Segmentation -> Mask -> PointCloud")
     parser.add_argument(
         "--config-file",
-        default=os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "configs", "InstanceSegmentation", "pointrend_rcnn_R_50_FPN_3x_plug.yaml")
-        ),
+        default=_DEFAULT_POINTREND_CONFIG,
+        help="共享配置文件。对 PointRend 保持兼容；对 Mask2Former 若未显式提供 base/prior config，将回退到内置默认配置。",
+    )
+    parser.add_argument("--config-file-base", default="", help="base 模型配置文件（可选）")
+    parser.add_argument("--config-file-prior", default="", help="prior/QSP 模型配置文件（可选）")
+    parser.add_argument(
+        "--model-family",
+        choices=["pointrend", "mask2former"],
+        default="pointrend",
+        help="选择实时推理后端：pointrend 或 mask2former。",
+    )
+    parser.add_argument(
+        "--mask2former-root",
+        default=_DEFAULT_MASK2FORMER_ROOT,
+        help="Mask2Former 仓库根目录（包含 mask2former/ 包）。仅 model-family=mask2former 时使用。",
     )
 
     # 对齐 visualize_predictions_under_highlight.py 的参数命名
-    parser.add_argument("--weights-base", default="", help="原版 PointRend 权重（no prior，对照用）")
-    parser.add_argument("--weights-prior", default="", help="带 shape prior 的权重（ShapeAwareCoarseMaskHead）")
+    parser.add_argument("--weights-base", default="", help="base 模型权重（PointRend 原版或 Mask2Former 原版）")
+    parser.add_argument("--weights-prior", default="", help="prior 模型权重（ShapePrior 或 Mask2Former+QSP）")
     # 兼容旧参数：--weights（等价于 --weights-prior）
     parser.add_argument("--weights", default="", help="(兼容) 等价于 --weights-prior")
 
@@ -619,7 +758,7 @@ def main():
     parser.add_argument(
         "--shape-prior-npy",
         default="",
-        help="形状先验 .npy 路径（会写入环境变量 SHAPE_PRIOR_PATH；留空则由 custom_heads.py 使用默认路径 outputs/plug_prior/plug_canonical_prior.npy）",
+        help="形状先验 .npy 路径。PointRend prior 会写入 SHAPE_PRIOR_PATH；Mask2Former+QSP 会覆盖 MODEL.MASK_FORMER.PRIOR_PATH。",
     )
     parser.add_argument(
         "--mode",
@@ -654,13 +793,15 @@ def main():
     parser.add_argument("--index", type=int, default=-1, help="discover 列表索引（可选）")
     parser.add_argument("--discover", action="store_true", help="仅扫描相机列表然后退出")
 
-    parser.add_argument("--win", default="Mech-Eye Live (PointRend+ShapePrior)", help="窗口标题")
+    parser.add_argument("--win", default="Mech-Eye Live Segmentation", help="窗口标题")
     parser.add_argument("--wait", type=int, default=1, help="cv2.waitKey 毫秒")
     parser.add_argument("--infer-every", type=int, default=1, help="每 N 帧跑一次分割（减轻算力压力）")
     parser.add_argument("--show-masks-only", action="store_true", help="只叠加掩码（不画 bbox/label）")
 
     parser.add_argument("--save-dir", default="", help="按 's' 保存输出到该目录（color/mask/ply）")
     parser.add_argument("--no-gui", action="store_true", help="不打开窗口（适合无 GUI，只保存）")
+    parser.add_argument("--capture-only", action="store_true", help="仅采集相机帧，不构建分割模型。")
+    parser.add_argument("--max-captures", type=int, default=0, help="自动采集 N 帧后退出（0 表示不限制）。")
     parser.add_argument("--save-depth", action="store_true", help="按 's' 额外保存 raw depth 的彩色渲染图（便于快速查看）")
     parser.add_argument("--show-depth", action="store_true", help="实时可视化 raw depth：显示 raw depth 的彩色渲染图")
     parser.add_argument("--save-raw-ply", action="store_true", help="按 's' 同时保存未加 mask 的原始点云（用于对照是否采集侧已碎）")
@@ -719,58 +860,118 @@ def main():
 
     mode = str(args.mode).strip().lower()
     pc_from = str(args.pc_from).strip().lower()
+    model_family = str(args.model_family).strip().lower()
+
+    shared_config = str(getattr(args, "config_file", "")).strip()
+    if shared_config and os.path.abspath(shared_config) == _DEFAULT_POINTREND_CONFIG:
+        shared_config_for_m2f = ""
+    else:
+        shared_config_for_m2f = shared_config
+
+    if model_family == "mask2former":
+        base_config_file = _require_existing_file(
+            str(args.config_file_base).strip() or shared_config_for_m2f or _DEFAULT_MASK2FORMER_BASE_CONFIG,
+            "Mask2Former base config",
+        )
+        prior_config_file = _require_existing_file(
+            str(args.config_file_prior).strip() or shared_config_for_m2f or _DEFAULT_MASK2FORMER_QSP_CONFIG,
+            "Mask2Former prior config",
+        )
+        family_prefix = "mask2former"
+        base_title = "BASE (Mask2Former)"
+        prior_title = "PRIOR (Mask2Former+QSP)"
+    else:
+        base_config_file = _require_existing_file(shared_config or _DEFAULT_POINTREND_CONFIG, "PointRend config")
+        prior_config_file = base_config_file
+        family_prefix = "pointrend"
+        base_title = "BASE (PointRend)"
+        prior_title = "PRIOR (PointRend+ShapePrior)"
 
     base_pred: Optional[DefaultPredictor] = None
     prior_pred: Optional[DefaultPredictor] = None
 
-    # prior 模式需要设置 SHAPE_PRIOR_PATH（ShapeAwareCoarseMaskHead 会从环境变量读取）
-    if mode in ("prior", "both") or pc_from == "prior":
-        prior_path = str(args.shape_prior_npy).strip()
-        if prior_path:
-            os.environ["SHAPE_PRIOR_PATH"] = os.path.abspath(prior_path)
-        # 如果用户没传 shape_prior_npy，则保留环境变量已有值；否则走 custom_heads 默认路径
-        env_prior = os.environ.get("SHAPE_PRIOR_PATH", "").strip()
-        default_prior_fn = getattr(custom_heads, "_default_prior_path", None)
-        default_prior = default_prior_fn() if callable(default_prior_fn) else ""
-        final_prior = env_prior or default_prior
-        print(f"[shape_prior] SHAPE_PRIOR_PATH={final_prior}")
-        # 明确写回 env，避免“env 为空但 default 存在”时，head 仍然读到空
-        if final_prior:
-            os.environ["SHAPE_PRIOR_PATH"] = final_prior
+    if not bool(args.capture_only):
+        prior_path_override = str(args.shape_prior_npy).strip()
+        if prior_path_override:
+            prior_path_override = _require_existing_file(prior_path_override, "prior npy")
 
-    # 构建 base / prior predictor（对齐 visualize 脚本）
-    if mode in ("base", "both") or pc_from == "base":
-        if not str(args.weights_base).strip():
-            raise ValueError("mode=base/both 或 pc-from=base 时必须提供 --weights-base")
-        base_pred = build_predictor(
-            config_file=str(args.config_file),
-            weights=os.path.abspath(str(args.weights_base).strip()),
-            mask_head_name="PointRendMaskHead",
-            num_classes=int(args.num_classes),
-            score_thresh=float(score_thr),
-            device=str(args.device),
-        )
+        # prior 模式需要设置 prior 路径
+        if mode in ("prior", "both") or pc_from == "prior":
+            if model_family == "mask2former":
+                if prior_path_override:
+                    print(f"[mask2former][qsp] PRIOR_PATH override={prior_path_override}")
+                else:
+                    print(f"[mask2former][qsp] PRIOR_PATH follows config: {prior_config_file}")
+            else:
+                if prior_path_override:
+                    os.environ["SHAPE_PRIOR_PATH"] = prior_path_override
+                # 如果用户没传 shape_prior_npy，则保留环境变量已有值；否则走 custom_heads 默认路径
+                env_prior = os.environ.get("SHAPE_PRIOR_PATH", "").strip()
+                default_prior_fn = getattr(custom_heads, "_default_prior_path", None)
+                default_prior = default_prior_fn() if callable(default_prior_fn) else ""
+                final_prior = env_prior or default_prior
+                print(f"[shape_prior] SHAPE_PRIOR_PATH={final_prior}")
+                if final_prior:
+                    os.environ["SHAPE_PRIOR_PATH"] = final_prior
 
-    if mode in ("prior", "both") or pc_from == "prior":
-        if not str(args.weights_prior).strip():
-            raise ValueError("mode=prior/both 或 pc-from=prior 时必须提供 --weights-prior（或用兼容参数 --weights）")
-        prior_pred = build_predictor(
-            config_file=str(args.config_file),
-            weights=os.path.abspath(str(args.weights_prior).strip()),
-            mask_head_name="ShapeAwareCoarseMaskHead",
-            num_classes=int(args.num_classes),
-            score_thresh=float(score_thr),
-            device=str(args.device),
-        )
+        # 构建 base / prior predictor
+        if mode in ("base", "both") or pc_from == "base":
+            if not str(args.weights_base).strip():
+                raise ValueError("mode=base/both 或 pc-from=base 时必须提供 --weights-base")
+            base_weights = _require_existing_file(str(args.weights_base).strip(), "base weights")
+            if model_family == "mask2former":
+                base_pred = build_mask2former_predictor(
+                    mask2former_root=str(args.mask2former_root),
+                    config_file=base_config_file,
+                    weights=base_weights,
+                    num_classes=int(args.num_classes),
+                    score_thresh=float(score_thr),
+                    device=str(args.device),
+                )
+            else:
+                base_pred = build_pointrend_predictor(
+                    config_file=base_config_file,
+                    weights=base_weights,
+                    mask_head_name="PointRendMaskHead",
+                    num_classes=int(args.num_classes),
+                    score_thresh=float(score_thr),
+                    device=str(args.device),
+                )
 
-    if base_pred is None and prior_pred is None:
-        raise RuntimeError("未构建任何 predictor：请检查 --mode/--pc-from 与权重参数是否匹配。")
+        if mode in ("prior", "both") or pc_from == "prior":
+            if not str(args.weights_prior).strip():
+                raise ValueError("mode=prior/both 或 pc-from=prior 时必须提供 --weights-prior（或用兼容参数 --weights）")
+            prior_weights = _require_existing_file(str(args.weights_prior).strip(), "prior weights")
+            if model_family == "mask2former":
+                prior_pred = build_mask2former_predictor(
+                    mask2former_root=str(args.mask2former_root),
+                    config_file=prior_config_file,
+                    weights=prior_weights,
+                    num_classes=int(args.num_classes),
+                    score_thresh=float(score_thr),
+                    device=str(args.device),
+                    prior_path_override=prior_path_override,
+                )
+            else:
+                prior_pred = build_pointrend_predictor(
+                    config_file=prior_config_file,
+                    weights=prior_weights,
+                    mask_head_name="ShapeAwareCoarseMaskHead",
+                    num_classes=int(args.num_classes),
+                    score_thresh=float(score_thr),
+                    device=str(args.device),
+                )
 
-    # 可视化用的 metadata（避免 metadata=None 导致 draw_instance_predictions 取类名时报错）
-    meta_name = "__mecheye_live_pointrend_shape_prior__"
-    metadata = MetadataCatalog.get(meta_name)
-    if not getattr(metadata, "thing_classes", None) or len(getattr(metadata, "thing_classes", [])) != int(args.num_classes):
-        metadata.thing_classes = [f"cls{i}" for i in range(int(args.num_classes))]
+        if base_pred is None and prior_pred is None:
+            raise RuntimeError("未构建任何 predictor：请检查 --mode/--pc-from 与权重参数是否匹配。")
+
+        # 可视化用的 metadata（避免 metadata=None 导致 draw_instance_predictions 取类名时报错）
+        meta_name = f"__mecheye_live_{family_prefix}__"
+        metadata = MetadataCatalog.get(meta_name)
+        if not getattr(metadata, "thing_classes", None) or len(getattr(metadata, "thing_classes", [])) != int(args.num_classes):
+            metadata.thing_classes = [f"cls{i}" for i in range(int(args.num_classes))]
+    else:
+        print("[capture-only] 跳过分割模型加载，仅进行相机采集。")
 
     def _add_titlebar(img_bgr: np.ndarray, title: str) -> np.ndarray:
         out_bgr = img_bgr.copy()
@@ -778,18 +979,8 @@ def main():
         cv2.putText(out_bgr, title, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         return out_bgr
 
-    def _viz_instances(img_bgr: np.ndarray, instances, title: str) -> np.ndarray:
-        v = Visualizer(
-            img_bgr[:, :, ::-1],
-            metadata=metadata,
-            scale=1.0,
-            instance_mode=ColorMode.IMAGE_BW if bool(args.show_masks_only) else ColorMode.IMAGE,
-        )
-        if bool(args.show_masks_only) and hasattr(instances, "pred_masks"):
-            out = v.overlay_instances(masks=instances.pred_masks)
-        else:
-            out = v.draw_instance_predictions(instances)
-        vis_bgr = out.get_image()[:, :, ::-1]
+    def _viz_mask(img_bgr: np.ndarray, mask_u8: np.ndarray, title: str) -> np.ndarray:
+        vis_bgr = _overlay_binary_mask(img_bgr, mask_u8, color_bgr=(80, 210, 160), alpha=0.35, outline=True)
         return _add_titlebar(vis_bgr, title)
 
     def _stack_horiz(imgs: list[np.ndarray]) -> np.ndarray:
@@ -881,18 +1072,50 @@ def main():
             color_bgr = color_sdk.data()  # numpy BGR
 
             do_infer = (int(args.infer_every) <= 1) or (frame_idx % int(args.infer_every) == 0)
-            if do_infer:
+            if bool(args.capture_only):
+                last_vis = color_bgr
+                last_color_bgr = color_bgr
+                last_depth = depth
+                last_color_sdk = color_sdk
+                if bool(args.show_depth) and not bool(args.no_gui):
+                    depth_np = depth.data()
+                    last_depth_render = _render_depth_data(depth_np)
+            elif do_infer:
                 panels: list[np.ndarray] = []
 
                 if mode in ("base", "both") and base_pred is not None:
                     base_out = base_pred(color_bgr)
                     base_inst = base_out["instances"].to("cpu")
-                    panels.append(_viz_instances(img_bgr=color_bgr, instances=base_inst, title="BASE (no prior)"))
+                    _base_mask_vis, base_mask_pc, _ = _build_output_masks(
+                        base_inst,
+                        mask_mode=str(args.mask_mode),
+                        pc_mask_mode=str(args.pc_mask_mode),
+                        pc_iou_thresh=float(args.pc_iou_thresh),
+                        pc_join_dilate=int(args.pc_join_dilate),
+                        mask_close=int(args.mask_close),
+                        mask_dilate=int(args.mask_dilate),
+                        mask_erode=int(args.mask_erode),
+                        invert_mask=bool(args.invert_mask),
+                        auto_invert_mask=bool(args.auto_invert_mask),
+                    )
+                    panels.append(_viz_mask(img_bgr=color_bgr, mask_u8=base_mask_pc, title=f"{base_title} | PC mask"))
 
                 if mode in ("prior", "both") and prior_pred is not None:
                     prior_out = prior_pred(color_bgr)
                     prior_inst = prior_out["instances"].to("cpu")
-                    panels.append(_viz_instances(img_bgr=color_bgr, instances=prior_inst, title="PRIOR (shape prior)"))
+                    _prior_mask_vis, prior_mask_pc, _ = _build_output_masks(
+                        prior_inst,
+                        mask_mode=str(args.mask_mode),
+                        pc_mask_mode=str(args.pc_mask_mode),
+                        pc_iou_thresh=float(args.pc_iou_thresh),
+                        pc_join_dilate=int(args.pc_join_dilate),
+                        mask_close=int(args.mask_close),
+                        mask_dilate=int(args.mask_dilate),
+                        mask_erode=int(args.mask_erode),
+                        invert_mask=bool(args.invert_mask),
+                        auto_invert_mask=bool(args.auto_invert_mask),
+                    )
+                    panels.append(_viz_mask(img_bgr=color_bgr, mask_u8=prior_mask_pc, title=f"{prior_title} | PC mask"))
 
                 if not panels:
                     last_vis = color_bgr
@@ -930,6 +1153,10 @@ def main():
             if key == ord("q"):
                 break
 
+            if int(args.max_captures) > 0 and frame_idx >= int(args.max_captures):
+                print(f"[capture] reached max captures={int(args.max_captures)}, auto stop.")
+                break
+
             if key == ord("s"):
                 if not save_dir:
                     print("未设置 --save-dir，无法保存。")
@@ -949,42 +1176,33 @@ def main():
                 # mask 用途分离：
                 # - mask_u8_vis：用于保存/调试（受 --mask-mode 控制）
                 # - mask_u8_pc：用于点云导出与 cleargrasp 点云过滤（受 --pc-mask-mode 控制）
-                mask_u8_vis = instances_to_binary_mask_u8(inst_for_pc, mask_mode=str(args.mask_mode))
-                mask_u8_vis = _morph_mask(mask_u8_vis, close=int(args.mask_close), dilate=int(args.mask_dilate), erode=int(args.mask_erode))
-                mask_u8_pc = instances_to_binary_mask_u8_pc(
+                mask_u8_vis, mask_u8_pc, invert_applied = _build_output_masks(
                     inst_for_pc,
-                    pc_mask_mode=str(args.pc_mask_mode),  # type: ignore[arg-type]
-                    iou_thresh=float(args.pc_iou_thresh),
-                    join_dilate=int(args.pc_join_dilate),
+                    mask_mode=str(args.mask_mode),
+                    pc_mask_mode=str(args.pc_mask_mode),
+                    pc_iou_thresh=float(args.pc_iou_thresh),
+                    pc_join_dilate=int(args.pc_join_dilate),
+                    mask_close=int(args.mask_close),
+                    mask_dilate=int(args.mask_dilate),
+                    mask_erode=int(args.mask_erode),
+                    invert_mask=bool(args.invert_mask),
+                    auto_invert_mask=bool(args.auto_invert_mask),
                 )
-                mask_u8_pc = _morph_mask(mask_u8_pc, close=int(args.mask_close), dilate=int(args.mask_dilate), erode=int(args.mask_erode))
-                # mask 方向选择：
-                # - invert-mask：强制反转
-                # - auto-invert-mask：自动选择“前景更小”的一侧作为目标（更符合只保留插头）
-                invert_applied = False
-                if bool(args.invert_mask):
-                    invert_applied = True
-                elif bool(args.auto_invert_mask):
-                    r0 = _mask_fg_ratio(mask_u8_pc)
-                    r1 = _mask_fg_ratio(255 - mask_u8_pc)
-                    invert_applied = r1 < r0
+                if bool(args.auto_invert_mask):
+                    r0 = _mask_fg_ratio(mask_u8_pc if not invert_applied else 255 - mask_u8_pc)
+                    r1 = _mask_fg_ratio(255 - (mask_u8_pc if not invert_applied else 255 - mask_u8_pc))
                     print(f"[mask][auto-invert] ratio_raw={r0:.3f} ratio_inv={r1:.3f} use={'invert' if invert_applied else 'raw'}")
-
-                if invert_applied:
-                    mask_u8_vis = 255 - mask_u8_vis
-                    mask_u8_pc = 255 - mask_u8_pc
 
                 print("[mask][vis] " + _mask_stats(mask_u8_vis))
                 print("[mask][pc ] " + _mask_stats(mask_u8_pc))
 
-                # 保存可视化：根据 pc-from 选择对应实例来画（与 mask 一致）
-                vis_bgr = _viz_instances(img_bgr=color_bgr, instances=inst_for_pc, title=f"PC_FROM={pc_from.upper()}")
+                # 保存可视化：直接显示最终用于点云的 mask，避免和点云过滤逻辑不一致
+                vis_bgr = _viz_mask(img_bgr=color_bgr, mask_u8=mask_u8_pc, title=f"PC_FROM={pc_from.upper()} | PC mask")
 
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 color_path = Path(save_dir) / f"mecheye_color_{ts}.png"
-                # 兼容旧命名：pointrend_mask/pointrend_vis（但增加后缀，明确来源）
-                mask_path = Path(save_dir) / f"pointrend_{pc_from}_mask_{ts}.png"
-                vis_path = Path(save_dir) / f"pointrend_{pc_from}_vis_{ts}.png"
+                mask_path = Path(save_dir) / f"{family_prefix}_{pc_from}_mask_{ts}.png"
+                vis_path = Path(save_dir) / f"{family_prefix}_{pc_from}_vis_{ts}.png"
                 ply_path = Path(save_dir) / f"{pc_from}_mask_pointcloud_{ts}.ply"
                 raw_ply_path = Path(save_dir) / f"raw_pointcloud_{ts}.ply"
                 depth_raw_path = Path(save_dir) / f"mecheye_depth_raw_{ts}.png"
@@ -1001,30 +1219,40 @@ def main():
                 # 如果同时跑了 base/prior，也把另一个的可视化/二值 mask 一并保存，便于离线对照
                 try:
                     if base_inst is not None and pc_from != "base":
-                        m_base = instances_to_binary_mask_u8_pc(
+                        _m_base_vis, m_base, _base_invert = _build_output_masks(
                             base_inst,
-                            pc_mask_mode=str(args.pc_mask_mode),  # type: ignore[arg-type]
-                            iou_thresh=float(args.pc_iou_thresh),
-                            join_dilate=int(args.pc_join_dilate),
+                            mask_mode=str(args.mask_mode),
+                            pc_mask_mode=str(args.pc_mask_mode),
+                            pc_iou_thresh=float(args.pc_iou_thresh),
+                            pc_join_dilate=int(args.pc_join_dilate),
+                            mask_close=int(args.mask_close),
+                            mask_dilate=int(args.mask_dilate),
+                            mask_erode=int(args.mask_erode),
+                            invert_mask=bool(args.invert_mask),
+                            auto_invert_mask=bool(args.auto_invert_mask),
                         )
-                        m_base = _morph_mask(m_base, close=int(args.mask_close), dilate=int(args.mask_dilate), erode=int(args.mask_erode))
-                        if invert_applied:
-                            m_base = 255 - m_base
-                        cv2.imwrite(str(Path(save_dir) / f"pointrend_base_mask_{ts}.png"), m_base)
-                        cv2.imwrite(str(Path(save_dir) / f"pointrend_base_vis_{ts}.png"), _viz_instances(color_bgr, base_inst, "BASE (no prior)"))
-                    if prior_inst is not None and pc_from != "prior":
-                        m_prior = instances_to_binary_mask_u8_pc(
-                            prior_inst,
-                            pc_mask_mode=str(args.pc_mask_mode),  # type: ignore[arg-type]
-                            iou_thresh=float(args.pc_iou_thresh),
-                            join_dilate=int(args.pc_join_dilate),
-                        )
-                        m_prior = _morph_mask(m_prior, close=int(args.mask_close), dilate=int(args.mask_dilate), erode=int(args.mask_erode))
-                        if invert_applied:
-                            m_prior = 255 - m_prior
-                        cv2.imwrite(str(Path(save_dir) / f"pointrend_prior_mask_{ts}.png"), m_prior)
+                        cv2.imwrite(str(Path(save_dir) / f"{family_prefix}_base_mask_{ts}.png"), m_base)
                         cv2.imwrite(
-                            str(Path(save_dir) / f"pointrend_prior_vis_{ts}.png"), _viz_instances(color_bgr, prior_inst, "PRIOR (shape prior)")
+                            str(Path(save_dir) / f"{family_prefix}_base_vis_{ts}.png"),
+                            _viz_mask(color_bgr, m_base, f"{base_title} | PC mask"),
+                        )
+                    if prior_inst is not None and pc_from != "prior":
+                        _m_prior_vis, m_prior, _prior_invert = _build_output_masks(
+                            prior_inst,
+                            mask_mode=str(args.mask_mode),
+                            pc_mask_mode=str(args.pc_mask_mode),
+                            pc_iou_thresh=float(args.pc_iou_thresh),
+                            pc_join_dilate=int(args.pc_join_dilate),
+                            mask_close=int(args.mask_close),
+                            mask_dilate=int(args.mask_dilate),
+                            mask_erode=int(args.mask_erode),
+                            invert_mask=bool(args.invert_mask),
+                            auto_invert_mask=bool(args.auto_invert_mask),
+                        )
+                        cv2.imwrite(str(Path(save_dir) / f"{family_prefix}_prior_mask_{ts}.png"), m_prior)
+                        cv2.imwrite(
+                            str(Path(save_dir) / f"{family_prefix}_prior_vis_{ts}.png"),
+                            _viz_mask(color_bgr, m_prior, f"{prior_title} | PC mask"),
                         )
                 except Exception as _e:
                     # 不影响主流程：仅用于额外对照输出

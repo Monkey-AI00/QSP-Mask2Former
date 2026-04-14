@@ -113,6 +113,18 @@ def parse_args() -> argparse.Namespace:
         help="可选：叠加可视化前先腐蚀预测 mask（像素，建议 2~4）以减弱边缘淡色光晕。",
     )
     p.add_argument("--score-thr", type=float, default=0.5, help="可视化过滤分数阈值（取最高分实例）")
+    p.add_argument("--num-classes", type=int, default=1, help="模型类别数。若为 plug+handle，请设为 2。")
+    p.add_argument(
+        "--class-names",
+        default="plug,handle",
+        help="类别名称列表，逗号分隔。仅用于多类别可视化标题/图例语义，默认 plug,handle。",
+    )
+    p.add_argument(
+        "--pred-mode",
+        choices=["best", "union"],
+        default="union",
+        help="可视化预测掩码方式：best=仅最高分实例；union=所有预测实例并集。多类别可视化推荐 union。",
+    )
     p.add_argument(
         "--show-highlight-col",
         action="store_true",
@@ -136,7 +148,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config-pointrend", default="", help="PointRend config yaml（可选）")
     p.add_argument("--weights-base", default="", help="BASE(no prior) PointRendMaskHead 权重（可选）")
     p.add_argument("--weights-spg", default="", help="SPG-PointRend 权重（ShapeAwareCoarseMaskHead，可选）")
-    p.add_argument("--shape-prior-npy", default="", help="shape prior .npy（用于 ShapeAwareCoarseMaskHead，可选）")
+    p.add_argument(
+        "--shape-prior-npy",
+        default="",
+        help="shape prior .npy。默认用于 ShapeAwareCoarseMaskHead；若未单独提供 --prior-path-mask2former-qsp，也会作为 Mask2Former+QSP 的 PRIOR_PATH 覆盖。",
+    )
 
     # Mask R-CNN (optional)
     p.add_argument("--config-maskrcnn", default="", help="Mask R-CNN config yaml（可选）")
@@ -225,6 +241,45 @@ def _erode_mask(mask01: np.ndarray, erode_px: int) -> np.ndarray:
     return (m2 > 0).astype(np.uint8)
 
 
+def _parse_class_names(s: str, num_classes: int) -> List[str]:
+    raw = [x.strip() for x in str(s).split(",") if x.strip()]
+    if len(raw) >= int(num_classes):
+        return raw[: int(num_classes)]
+    out = list(raw)
+    while len(out) < int(num_classes):
+        out.append(f"cls{len(out)}")
+    return out
+
+
+def _class_color_bgr(class_idx: int) -> Tuple[int, int, int]:
+    palette = [
+        (80, 210, 80),    # green for plug
+        (40, 170, 255),   # orange for handle
+        (190, 120, 235),  # magenta
+        (235, 150, 210),  # pink
+        (90, 170, 230),   # blue
+        (110, 215, 120),  # light green
+    ]
+    return palette[int(class_idx) % len(palette)]
+
+
+def _apply_display_class_rules(class_masks: dict[int, np.ndarray], class_names: List[str]) -> dict[int, np.ndarray]:
+    """
+    仅影响显示，不改变模型预测本身。
+    当前规则：若同时存在 plug 和 handle，则显示时将 plug 区域扣除 handle，
+    让两类在叠加图上互斥，便于观察部件边界。
+    """
+    out = {int(k): v.copy() for k, v in class_masks.items()}
+    name_to_idx = {str(name).strip().lower(): idx for idx, name in enumerate(class_names)}
+    plug_idx = name_to_idx.get("plug")
+    handle_idx = name_to_idx.get("handle")
+    if plug_idx is not None and handle_idx is not None and plug_idx in out and handle_idx in out:
+        plug_mask = (out[plug_idx] > 0)
+        handle_mask = (out[handle_idx] > 0)
+        out[plug_idx] = (plug_mask & (~handle_mask)).astype(np.uint8)
+    return out
+
+
 def _highlight_mask(img_bgr: np.ndarray, v_thr: int, s_max: int, dilate_px: int) -> np.ndarray:
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     _h, s, v = cv2.split(hsv)
@@ -280,20 +335,64 @@ def _remove_halo_with_clean_and_hi(*, img_highlight_bgr: np.ndarray, img_clean_b
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _predict_best_mask(predictor: DefaultPredictor, img_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], object]:
+def _predict_mask(
+    predictor: DefaultPredictor,
+    img_bgr: np.ndarray,
+    *,
+    mode: str = "union",
+) -> Tuple[Optional[np.ndarray], object]:
     out = predictor(img_bgr)
     inst = out.get("instances", None)
     if inst is None or len(inst) == 0:
         return None, inst
     inst_cpu = inst.to("cpu")
-    if hasattr(inst_cpu, "scores"):
-        idx = int(inst_cpu.scores.argmax().item())
-    else:
-        idx = 0
     if not hasattr(inst_cpu, "pred_masks"):
         return None, inst_cpu
-    m = inst_cpu.pred_masks[idx].numpy().astype(np.uint8)
+    pred_masks = inst_cpu.pred_masks.numpy().astype(np.uint8)
+    if pred_masks.ndim != 3 or pred_masks.shape[0] == 0:
+        return None, inst_cpu
+    if str(mode).strip().lower() == "best":
+        if hasattr(inst_cpu, "scores"):
+            idx = int(inst_cpu.scores.argmax().item())
+        else:
+            idx = 0
+        m = pred_masks[idx]
+    else:
+        m = np.any(pred_masks, axis=0).astype(np.uint8)
     return m, inst_cpu
+
+
+def _predict_class_masks(
+    predictor: DefaultPredictor,
+    img_bgr: np.ndarray,
+    *,
+    mode: str = "union",
+    num_classes: int,
+) -> Tuple[dict[int, np.ndarray], object]:
+    out = predictor(img_bgr)
+    inst = out.get("instances", None)
+    if inst is None or len(inst) == 0:
+        return {}, inst
+    inst_cpu = inst.to("cpu")
+    if not hasattr(inst_cpu, "pred_masks") or not hasattr(inst_cpu, "pred_classes"):
+        return {}, inst_cpu
+    pred_masks = inst_cpu.pred_masks.numpy().astype(np.uint8)
+    pred_classes = inst_cpu.pred_classes.numpy().astype(np.int64)
+    scores = inst_cpu.scores.numpy() if hasattr(inst_cpu, "scores") else None
+    out_masks: dict[int, np.ndarray] = {}
+    for cls_idx in range(int(num_classes)):
+        sel = np.where(pred_classes == int(cls_idx))[0]
+        if sel.size == 0:
+            continue
+        if str(mode).strip().lower() == "best":
+            if scores is not None and scores.size > 0:
+                best_local = int(sel[np.argmax(scores[sel])])
+            else:
+                best_local = int(sel[0])
+            out_masks[int(cls_idx)] = pred_masks[best_local]
+        else:
+            out_masks[int(cls_idx)] = np.any(pred_masks[sel], axis=0).astype(np.uint8)
+    return out_masks, inst_cpu
 
 
 def _build_pointrend_predictor(
@@ -474,6 +573,7 @@ def _ordered_methods(methods: List[_Method]) -> List[_Method]:
 def main() -> None:
     args = parse_args()
     random.seed(int(args.seed))
+    class_names = _parse_class_names(str(getattr(args, "class_names", "")), int(args.num_classes))
 
     dataset_root = os.path.abspath(str(args.dataset_root))
     out_dir = os.path.abspath(str(args.out_dir))
@@ -547,7 +647,7 @@ def main() -> None:
         pred = _build_maskrcnn_predictor(
             config_file=os.path.abspath(str(args.config_maskrcnn).strip()),
             weights=os.path.abspath(str(args.weights_maskrcnn).strip()),
-            num_classes=1,  # plug 默认 1；如需自动多类，建议改成命令行传入
+            num_classes=int(args.num_classes),
             score_thr=float(args.score_thr),
         )
         methods.append(_Method("maskrcnn", "Mask R-CNN", pred, (90, 170, 230)))
@@ -562,7 +662,7 @@ def main() -> None:
             config_file=os.path.abspath(str(args.config_pointrend).strip()),
             weights=os.path.abspath(str(args.weights_base).strip()),
             mask_head_name="PointRendMaskHead",
-            num_classes=1,
+            num_classes=int(args.num_classes),
             score_thr=float(args.score_thr),
         )
         methods.append(_Method("base", "PointRend", pred, (110, 185, 245)))
@@ -572,7 +672,7 @@ def main() -> None:
             config_file=os.path.abspath(str(args.config_pointrend).strip()),
             weights=os.path.abspath(str(args.weights_spg).strip()),
             mask_head_name="ShapeAwareCoarseMaskHead",
-            num_classes=1,
+            num_classes=int(args.num_classes),
             score_thr=float(args.score_thr),
         )
         methods.append(_Method("spg", "SPG-PointRend", pred, (110, 215, 120)))
@@ -596,7 +696,7 @@ def main() -> None:
             mask2former_root=str(args.mask2former_root).strip(),
             config_file=os.path.abspath(str(args.config_mask2former).strip()),
             weights=os.path.abspath(str(args.weights_mask2former).strip()),
-            num_classes=1,
+            num_classes=int(args.num_classes),
             score_thr=float(args.score_thr),
         )
         methods.append(_Method("m2f", "Mask2Former", pred, (190, 120, 235)))
@@ -606,7 +706,7 @@ def main() -> None:
             mask2former_root=str(args.mask2former_root).strip(),
             config_file=os.path.abspath(str(args.config_mask2former).strip()),
             weights=os.path.abspath(str(args.weights_mask2former_sdf).strip()),
-            num_classes=1,
+            num_classes=int(args.num_classes),
             score_thr=float(args.score_thr),
         )
         methods.append(_Method("m2f_sdf", "Mask2Former + SDF", pred, (235, 150, 210)))
@@ -617,15 +717,16 @@ def main() -> None:
         ).strip()
         if not config_mask2former_qsp:
             raise ValueError("提供 --weights-mask2former-qsp 时必须同时提供 --config-mask2former-qsp 或 --config-mask2former")
+        qsp_prior_override = str(getattr(args, "prior_path_mask2former_qsp", "")).strip() or str(
+            getattr(args, "shape_prior_npy", "")
+        ).strip()
         pred = _build_mask2former_predictor(
             mask2former_root=str(args.mask2former_root).strip(),
             config_file=os.path.abspath(config_mask2former_qsp),
             weights=os.path.abspath(str(args.weights_mask2former_qsp).strip()),
-            num_classes=1,
+            num_classes=int(args.num_classes),
             score_thr=float(args.score_thr),
-            prior_path_override=os.path.abspath(str(args.prior_path_mask2former_qsp).strip())
-            if str(getattr(args, "prior_path_mask2former_qsp", "")).strip()
-            else "",
+            prior_path_override=os.path.abspath(qsp_prior_override) if qsp_prior_override else "",
         )
         methods.append(_Method("m2f_qsp", "Mask2Former + QSP", pred, (80, 210, 160)))
 
@@ -667,12 +768,36 @@ def main() -> None:
         # predictions
         ep = int(getattr(args, "pred_erode", 0))
         for m in methods:
-            pr, _inst = _predict_best_mask(m.predictor, img_bgr)
-            if pr is None:
-                pr = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
-            pr_vis = _erode_mask(pr, ep)
-            vis = _overlay_mask(input_bgr, pr_vis, color_bgr=m.color_bgr, alpha=0.35, outline=True)
-            vis = _title_bar(vis, m.title)
+            if int(args.num_classes) > 1:
+                class_masks, _inst = _predict_class_masks(
+                    m.predictor,
+                    img_bgr,
+                    mode=str(args.pred_mode),
+                    num_classes=int(args.num_classes),
+                )
+                class_masks = _apply_display_class_rules(class_masks, class_names)
+                vis = input_bgr.copy()
+                used_names: List[str] = []
+                if class_masks:
+                    for cls_idx in sorted(class_masks.keys()):
+                        pr_vis = _erode_mask(class_masks[cls_idx], ep)
+                        vis = _overlay_mask(
+                            vis,
+                            pr_vis,
+                            color_bgr=_class_color_bgr(int(cls_idx)),
+                            alpha=0.35,
+                            outline=True,
+                        )
+                        used_names.append(class_names[int(cls_idx)])
+                title = m.title if not used_names else f"{m.title} ({'/'.join(used_names)})"
+                vis = _title_bar(vis, title)
+            else:
+                pr, _inst = _predict_mask(m.predictor, img_bgr, mode=str(args.pred_mode))
+                if pr is None:
+                    pr = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+                pr_vis = _erode_mask(pr, ep)
+                vis = _overlay_mask(input_bgr, pr_vis, color_bgr=m.color_bgr, alpha=0.35, outline=True)
+                vis = _title_bar(vis, m.title)
             cells.append(vis)
 
         cells = [_resize_to_width(c, int(args.cell_width)) for c in cells]
