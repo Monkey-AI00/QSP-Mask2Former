@@ -21,7 +21,7 @@ Mask2Former 在 plug 数据集上的训练脚本（风格对齐 train_maskrcnn_p
 """
 
 from __future__ import annotations
-
+import torch
 import importlib.util
 import os
 import sys
@@ -118,8 +118,6 @@ def setup(args):
     cfg.DATALOADER.NUM_WORKERS = 0
 
     # 设备
-    import torch
-
     cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 训练/推理任务开关（确保是 instance seg）

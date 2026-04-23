@@ -365,9 +365,16 @@ class GripperController:
         self._import_gripper_module()
 
     def _import_gripper_module(self):
-        gripper_dir = Path(__file__).resolve().parents[2] / "Gripper" / "Gripper"
-        if str(gripper_dir) not in sys.path:
-            sys.path.append(str(gripper_dir))
+        # 兼容两种目录布局：
+        # 1) src/detectron2/Gripper
+        # 2) src/detectron2/Gripper/Gripper
+        cand_dirs = [
+            Path(__file__).resolve().parents[2] / "Gripper",
+            Path(__file__).resolve().parents[2] / "Gripper" / "Gripper",
+        ]
+        for d in cand_dirs:
+            if d.exists() and str(d) not in sys.path:
+                sys.path.append(str(d))
         import dh_modbus_gripper  # noqa: PLC0415  # type: ignore[reportMissingImports]
         import time  # noqa: PLC0415
         self._dh_modbus_gripper = dh_modbus_gripper
@@ -398,7 +405,10 @@ class GripperController:
 
         self._gripper = g
         self._opened = True
-        print(f"[gripper] initialized once: port={self.port}, baudrate={self.baudrate}")
+        print(
+            f"[gripper] initialized once: port={self.port}, baudrate={self.baudrate}, "
+            "control=RS485(Modbus RTU)"
+        )
 
     def set_position(self, position: int, *, action_name: str) -> None:
         if not self._opened or self._gripper is None:
@@ -411,6 +421,11 @@ class GripperController:
 
     def close_gripper(self, position: int) -> None:
         self.set_position(int(position), action_name="close")
+
+    def get_status(self) -> dict:
+        if not self._opened or self._gripper is None:
+            raise RuntimeError("gripper not initialized")
+        return dict(self._gripper.GetStatusSnapshot())
 
     def release(self) -> None:
         if self._opened and self._gripper is not None:
