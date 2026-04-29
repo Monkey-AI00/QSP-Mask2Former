@@ -1,102 +1,39 @@
-#!/usr/bin/env python3
+"""ICP backend extracted from legacy pipeline."""
+
 from __future__ import annotations
 
+import copy
 from typing import Any, Optional
 
 import numpy as np
 
-
-def _parse_csv_floats(text: str, n: int) -> np.ndarray:
-    arr = [float(x.strip()) for x in str(text).split(",") if x.strip()]
-    if len(arr) != n:
-        raise ValueError(f"期望 {n} 个数值，实际 {len(arr)}: {text}")
-    return np.asarray(arr, dtype=np.float64)
-
-
-def _unit(v: np.ndarray) -> np.ndarray:
-    x = np.asarray(v, dtype=np.float64).reshape(3)
-    n = float(np.linalg.norm(x))
-    if n <= 1e-12:
-        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    return x / n
+from online_grasp.geometry.transforms import (
+    _make_T_from_xyz_m,
+    _parse_csv_floats,
+    _pca_basis,
+    _unit,
+)
 
 
-def _pca_basis(points_xyz: np.ndarray) -> np.ndarray:
-    pts = np.asarray(points_xyz, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 10:
-        return np.eye(3, dtype=np.float64)
-    c = np.mean(pts, axis=0, keepdims=True)
-    x = pts - c
-    cov = (x.T @ x) / max(1, x.shape[0] - 1)
-    w, v = np.linalg.eigh(cov)
-    order = np.argsort(w)[::-1]
-    v = v[:, order]
-    if np.linalg.det(v) < 0:
-        v[:, 2] *= -1.0
-    return v
-
-
-def _make_T_from_xyz_m(xyz_m: np.ndarray) -> np.ndarray:
-    T = np.eye(4, dtype=np.float64)
-    T[:3, 3] = np.asarray(xyz_m, dtype=np.float64).reshape(3)
-    return T
-
-
-class ICPRegistrationCore:
-    def __init__(
-        self,
-        args,
-        o3d,
-        reg_target_pcd,
-        *,
-        reg_target_name: str = "grasp_region_cad(from_cad_ply)",
-        use_local_region_template: bool = True,
-        T_source_to_target_manual_init: Optional[np.ndarray] = None,
-        last_T_source_to_target: Optional[np.ndarray] = None,
-        consecutive_icp_failures: int = 0,
-    ):
+class ICPBackend:
+    def __init__(self, args, o3d):
         self.args = args
         self.o3d = o3d
-        self.reg_target_pcd = reg_target_pcd
-        self.reg_target_name = reg_target_name
-        self.use_local_region_template = bool(use_local_region_template)
-        self.T_source_to_target_manual_init = (
-            None if T_source_to_target_manual_init is None else np.asarray(T_source_to_target_manual_init, dtype=np.float64)
-        )
-        self._last_T_source_to_target = (
-            None if last_T_source_to_target is None else np.asarray(last_T_source_to_target, dtype=np.float64)
-        )
-        self._consecutive_icp_failures = int(consecutive_icp_failures)
-        self._last_icp_pose_source = "unknown"
+        self._frame_idx = 0
+        self.source_buffer = []
+        self.reg_target_pcd = None
+        self.reg_target_name = "handle_target.ply(local grasp region)"
+        self.use_local_region_template = True
+        self._last_T_source_to_target: Optional[np.ndarray] = None
+        self._consecutive_icp_failures: int = 0
+        self._last_icp_pose_source: str = "unknown"
         self._last_icp_quality: dict[str, Any] = {}
-
-    @property
-    def last_T_source_to_target(self) -> Optional[np.ndarray]:
-        return None if self._last_T_source_to_target is None else np.asarray(self._last_T_source_to_target, dtype=np.float64)
-
-    @property
-    def consecutive_icp_failures(self) -> int:
-        return int(self._consecutive_icp_failures)
-
-    @property
-    def last_icp_pose_source(self) -> str:
-        return str(self._last_icp_pose_source)
-
-    @property
-    def last_icp_quality(self) -> dict[str, Any]:
-        return dict(self._last_icp_quality)
-
-    def set_track_state(self, last_T_source_to_target: Optional[np.ndarray], consecutive_icp_failures: int) -> None:
-        self._last_T_source_to_target = (
-            None if last_T_source_to_target is None else np.asarray(last_T_source_to_target, dtype=np.float64)
-        )
-        self._consecutive_icp_failures = int(consecutive_icp_failures)
+        self.T_source_to_target_manual_init: Optional[np.ndarray] = None
+        self.T_region_to_grasp = np.eye(4, dtype=np.float64)
 
     def _clone_pcd(self, pcd):
         if hasattr(pcd, "clone"):
             return pcd.clone()
-        import copy
-
         return copy.deepcopy(pcd)
 
     def _pcd_stats_str(self, pcd, name: str) -> str:
@@ -119,6 +56,65 @@ class ICPRegistrationCore:
             return np.zeros(3, dtype=np.float64)
         pts = np.asarray(pcd.points, dtype=np.float64)
         return pts.max(axis=0) - pts.min(axis=0)
+
+    def _update_and_fuse_source(self, pcd):
+        if len(pcd.points) > 0:
+            src_to_buffer = self._clone_pcd(pcd)
+            if bool(self.args.fusion_after_coarse_align):
+                src_to_buffer = self._coarse_align_for_fusion(src_to_buffer)
+            self.source_buffer.append(src_to_buffer)
+        valid = [x for x in self.source_buffer if len(x.points) > 0]
+        required = int(self.args.fusion_frames)
+        if len(valid) < required:
+            raise RuntimeError(f"SKIP: 融合有效帧未达完整窗口: {len(valid)}/{required}")
+        fused = self.o3d.geometry.PointCloud()
+        for x in valid:
+            fused += x
+        fused = fused.voxel_down_sample(float(self.args.fusion_voxel))
+        if len(fused.points) < int(self.args.fused_min_points):
+            raise RuntimeError(f"融合点数不足: {len(fused.points)} < {int(self.args.fused_min_points)}")
+        print(
+            f"[fusion] frames={len(valid)}/{int(self.args.fusion_frames)} "
+            f"fused_points={len(fused.points)} voxel={float(self.args.fusion_voxel):.4f}"
+        )
+        return fused, len(valid)
+
+    def _coarse_align_for_fusion(self, source_pcd):
+        src = source_pcd.voxel_down_sample(float(self.args.icp_voxel))
+        if len(src.points) < int(self.args.min_points):
+            raise RuntimeError(f"SKIP: fusion_after_coarse_align 点数不足: {len(src.points)}")
+        target = self.reg_target_pcd
+        reg = self.o3d.pipelines.registration
+        coarse_dist = float(self.args.icp_voxel) * float(self.args.coarse_icp_dist_mult)
+        eval_dist = max(coarse_dist * 1.2, coarse_dist)
+        init_candidates = self._build_init_candidates(src, target)
+        scored = self._score_init_candidates(src, target, init_candidates, eval_dist=eval_dist)
+        best = self._select_best_init(scored)
+        if best is None or float(best["fitness"]) < float(self.args.icp_coarse_fitness_thr):
+            raise RuntimeError(
+                f"SKIP: fusion_after_coarse_align init 失败，best_fitness="
+                f"{0.0 if best is None else float(best['fitness']):.4f}"
+            )
+        coarse = reg.registration_icp(
+            src,
+            target,
+            max_correspondence_distance=coarse_dist,
+            init=np.asarray(best["T"], dtype=np.float64),
+            estimation_method=reg.TransformationEstimationPointToPoint(),
+            criteria=reg.ICPConvergenceCriteria(max_iteration=max(10, int(self.args.max_icp_stage1) // 2)),
+        )
+        if float(coarse.fitness) < float(self.args.icp_stage1_fitness_thr):
+            raise RuntimeError(
+                f"SKIP: fusion_after_coarse_align coarse 失败: "
+                f"{float(coarse.fitness):.4f} < {float(self.args.icp_stage1_fitness_thr):.4f}"
+            )
+        src_aligned = self._clone_pcd(source_pcd)
+        src_aligned.transform(np.asarray(coarse.transformation, dtype=np.float64))
+        print(
+            f"[fusion] fusion_after_coarse_align=True coarse_fit={float(coarse.fitness):.4f} "
+            f"rmse={float(coarse.inlier_rmse):.6f}"
+        )
+        return src_aligned
 
     def _check_extent_consistency(self, source_pcd, target_pcd) -> None:
         es = self._pcd_extent(source_pcd)
@@ -259,45 +255,6 @@ class ICPRegistrationCore:
             )
         return cands
 
-    def _thin_source_main_surface(self, pcd, *, axis_mode_override: Optional[str] = None):
-        if not bool(self.args.surface_thin_enable):
-            return pcd
-        if len(pcd.points) <= 0:
-            raise RuntimeError("SKIP: 主曲面提纯输入为空")
-        pts = np.asarray(pcd.points, dtype=np.float64)
-        center = pts.mean(axis=0)
-        axis_mode = str(axis_mode_override or self.args.surface_thin_axis).strip().lower()
-        if axis_mode == "auto":
-            basis = _pca_basis(pts)
-            axis = basis[:, 2]
-        elif axis_mode == "x":
-            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        elif axis_mode == "y":
-            axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        elif axis_mode == "z":
-            axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        else:
-            raise ValueError(f"未知 surface_thin_axis: {axis_mode}")
-        axis = _unit(axis)
-        proj = (pts - center) @ axis
-        mid = float(np.median(proj))
-        band_m = max(1e-4, float(self.args.surface_thin_band_mm) * 0.001)
-        half = band_m * 0.5
-        keep_mask = np.abs(proj - mid) <= half
-        keep_idx = np.flatnonzero(keep_mask)
-        kept = int(keep_idx.size)
-        total = int(pts.shape[0])
-        keep_ratio = kept / max(1, total)
-        print(
-            f"[surface-thin] axis={axis_mode} axis_vec={axis.tolist()} "
-            f"band_mm={float(self.args.surface_thin_band_mm):.2f} keep={kept}/{total} ({keep_ratio:.3f})"
-        )
-        if kept < int(self.args.surface_thin_min_points):
-            raise RuntimeError(
-                f"SKIP: 主曲面提纯后点数不足: {kept} < {int(self.args.surface_thin_min_points)}"
-            )
-        return pcd.select_by_index(keep_idx.tolist())
-
     def _transform_rot_deg(self, R: np.ndarray) -> float:
         r = np.asarray(R, dtype=np.float64).reshape(3, 3)
         cos_theta = (np.trace(r) - 1.0) * 0.5
@@ -370,14 +327,78 @@ class ICPRegistrationCore:
             return np.asarray(T_coarse, dtype=np.float64), "coarse", reasons
         return np.asarray(T_refine, dtype=np.float64), "refine", []
 
-    def estimate_pose_and_grasp(
+    def _thin_source_main_surface(self, pcd, *, axis_mode_override: Optional[str] = None):
+        if not bool(self.args.surface_thin_enable):
+            return pcd
+        if len(pcd.points) <= 0:
+            raise RuntimeError("SKIP: 主曲面提纯输入为空")
+        pts = np.asarray(pcd.points, dtype=np.float64)
+        center = pts.mean(axis=0)
+        axis_mode = str(axis_mode_override or self.args.surface_thin_axis).strip().lower()
+        if axis_mode == "auto":
+            basis = _pca_basis(pts)
+            axis = basis[:, 2]
+        elif axis_mode == "x":
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        elif axis_mode == "y":
+            axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        elif axis_mode == "z":
+            axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            raise ValueError(f"未知 surface_thin_axis: {axis_mode}")
+        axis = _unit(axis)
+        proj = (pts - center) @ axis
+        mid = float(np.median(proj))
+        band_m = max(1e-4, float(self.args.surface_thin_band_mm) * 0.001)
+        half = band_m * 0.5
+        keep_mask = np.abs(proj - mid) <= half
+        keep_idx = np.flatnonzero(keep_mask)
+        kept = int(keep_idx.size)
+        total = int(pts.shape[0])
+        keep_ratio = kept / max(1, total)
+        print(
+            f"[surface-thin] axis={axis_mode} axis_vec={axis.tolist()} "
+            f"band_mm={float(self.args.surface_thin_band_mm):.2f} keep={kept}/{total} ({keep_ratio:.3f})"
+        )
+        if kept < int(self.args.surface_thin_min_points):
+            raise RuntimeError(
+                f"SKIP: 主曲面提纯后点数不足: {kept} < {int(self.args.surface_thin_min_points)}"
+            )
+        return pcd.select_by_index(keep_idx.tolist())
+
+    def _visualize_icp_overlay(
         self,
-        fused_source_pcd,
-        T_base_cam: np.ndarray,
-        T_region_to_grasp: np.ndarray,
+        raw_source_pcd,
+        source_pcd,
+        target_pcd,
+        T_source_to_cad: np.ndarray,
         *,
-        fused_frames: int,
-    ) -> dict[str, Any]:
+        stage1_fitness: float,
+        stage1_rmse: float,
+        coarse_fitness: float,
+        fine_fitness: float,
+        rmse: float,
+    ) -> None:
+        raw_vis = self._clone_pcd(raw_source_pcd)
+        src_vis = self._clone_pcd(source_pcd)
+        tgt_vis = self._clone_pcd(target_pcd)
+        raw_vis.paint_uniform_color([1.0, 0.45, 0.0])
+        src_vis.paint_uniform_color([1.0, 0.85, 0.0])
+        tgt_vis.paint_uniform_color([0.0, 0.8, 0.0])
+        raw_vis.transform(np.asarray(T_source_to_cad, dtype=np.float64))
+        src_vis.transform(np.asarray(T_source_to_cad, dtype=np.float64))
+        win_name = (
+            f"ICP overlay | orange=raw_fused_source | yellow=surface_thinned_source | green={self.reg_target_name} "
+            f"| frame={self._frame_idx} raw={len(raw_source_pcd.points)} thin={len(source_pcd.points)} tgt={len(target_pcd.points)} "
+            f"| stage1_fit={stage1_fitness:.3f} stage1_rmse={stage1_rmse:.4f} "
+            f"| init_fit={coarse_fitness:.3f} stage2_fit={fine_fitness:.3f} stage2_rmse={rmse:.4f}"
+        )
+        self.o3d.visualization.draw_geometries([raw_vis, src_vis, tgt_vis], window_name=win_name)
+
+    def update_and_fuse_source(self, pcd):
+        return self._update_and_fuse_source(pcd)
+
+    def estimate_pose_and_grasp(self, fused_source_pcd, T_base_cam: np.ndarray, *, fused_frames: int):
         raw_source = fused_source_pcd.voxel_down_sample(float(self.args.icp_voxel))
         if len(raw_source.points) < int(self.args.min_points):
             raise RuntimeError(f"SKIP: 点云点数不足: {len(raw_source.points)}")
@@ -394,6 +415,8 @@ class ICPRegistrationCore:
         coarse_dist = float(self.args.icp_voxel) * float(self.args.coarse_icp_dist_mult)
         refine_dist = float(self.args.icp_voxel) * float(self.args.refine_icp_dist_mult)
         eval_dist = max(coarse_dist * 1.2, coarse_dist)
+
+        # stage0: last_success > online candidates > manual_fixed
         init_candidates = self._build_init_candidates(raw_source, target)
         if not init_candidates:
             raise RuntimeError("SKIP: 缺少可用初始位姿（last_success/online/manual 均不可用）")
@@ -416,6 +439,8 @@ class ICPRegistrationCore:
             )
         T_init = np.asarray(best_init["T"], dtype=np.float64)
         print("[icp][init] T_source_to_target=" + np.array2string(T_init, precision=5, suppress_small=True))
+
+        # coarse ICP: 大距离 p2p，把初值拉进正确 basin
         coarse = reg.registration_icp(
             raw_source,
             target,
@@ -440,6 +465,8 @@ class ICPRegistrationCore:
             raise RuntimeError(
                 f"SKIP: ICP coarse rmse 过高: {float(coarse.inlier_rmse):.6f} > {float(self.args.icp_stage1_rmse_thr):.6f}"
             )
+
+        # coarse 后再做主曲面提纯，减少未对齐时薄片方向不稳定
         source_coarse_aligned = self._clone_pcd(raw_source)
         source_coarse_aligned.transform(np.asarray(coarse.transformation, dtype=np.float64))
         axis_mode = str(self.args.surface_thin_axis).strip().lower()
@@ -454,6 +481,8 @@ class ICPRegistrationCore:
             search_param=self.o3d.geometry.KDTreeSearchParamHybrid(radius=float(self.args.icp_voxel) * 2.5, max_nn=40)
         )
         source_refine_aligned.normalize_normals()
+
+        # refine ICP: 小距离 p2pl，毫米级精配准
         refine = reg.registration_icp(
             source_refine_aligned,
             target,
@@ -470,14 +499,37 @@ class ICPRegistrationCore:
             "[icp][refine] T_residual="
             + np.array2string(np.asarray(refine.transformation, dtype=np.float64), precision=5, suppress_small=True)
         )
-        T_source_to_region_refine = np.asarray(refine.transformation, dtype=np.float64) @ np.asarray(coarse.transformation, dtype=np.float64)
+
+        T_source_to_region = np.asarray(refine.transformation, dtype=np.float64) @ np.asarray(coarse.transformation, dtype=np.float64)
         print(
             "[icp][refine] T_source_to_target_final="
-            + np.array2string(np.asarray(T_source_to_region_refine, dtype=np.float64), precision=5, suppress_small=True)
+            + np.array2string(np.asarray(T_source_to_region, dtype=np.float64), precision=5, suppress_small=True)
         )
+
+        if bool(self.args.vis_icp):
+            every = max(1, int(self.args.vis_icp_every))
+            should_vis = (self._frame_idx % every == 0)
+            if bool(self.args.vis_icp_only_fail):
+                should_vis = should_vis and (float(refine.fitness) <= float(self.args.vis_icp_fail_thr))
+            if should_vis:
+                source_refine_raw = self._clone_pcd(source_refine_aligned)
+                source_refine_raw.transform(np.linalg.inv(np.asarray(coarse.transformation, dtype=np.float64)))
+                print("[icp][vis] 打开 ICP 叠加窗口（关闭窗口后主循环继续）")
+                self._visualize_icp_overlay(
+                    raw_source,
+                    source_refine_raw,
+                    target,
+                    np.asarray(T_source_to_region, dtype=np.float64),
+                    stage1_fitness=float(coarse.fitness),
+                    stage1_rmse=float(coarse.inlier_rmse),
+                    coarse_fitness=float(best_init["fitness"]),
+                    fine_fitness=float(refine.fitness),
+                    rmse=float(refine.inlier_rmse),
+                )
+
         T_final, final_src, fb_reasons = self._select_final_icp_transform(
             np.asarray(coarse.transformation, dtype=np.float64),
-            np.asarray(T_source_to_region_refine, dtype=np.float64),
+            np.asarray(T_source_to_region, dtype=np.float64),
             coarse_fitness=float(coarse.fitness),
             coarse_rmse=float(coarse.inlier_rmse),
             refine_fitness=float(refine.fitness),
@@ -503,34 +555,34 @@ class ICPRegistrationCore:
             if (float(coarse.fitness) < float(self.args.icp_stage1_fitness_thr)) or (
                 float(coarse.inlier_rmse) > float(self.args.icp_stage1_rmse_thr)
             ):
-                raise RuntimeError("SKIP: refine 回退到 coarse 后质量仍不满足阈值")
+                raise RuntimeError(
+                    "SKIP: refine 回退到 coarse 后质量仍不满足阈值"
+                )
             print(f"[icp][fallback] final_pose_source=coarse reasons={' | '.join(fb_reasons) if fb_reasons else 'none'}")
+
         T_source_to_region = np.asarray(T_final, dtype=np.float64)
         self._last_icp_pose_source = str(final_src)
         print(f"[icp][quality] final_pose_source={self._last_icp_pose_source}")
         self._last_T_source_to_target = T_source_to_region.copy()
         self._consecutive_icp_failures = 0
         T_region_cam = np.linalg.inv(T_source_to_region)
-        T_region_to_grasp = np.asarray(T_region_to_grasp, dtype=np.float64)
+        T_region_to_grasp = np.asarray(self.T_region_to_grasp, dtype=np.float64)
         T_grasp_cam = T_region_cam @ T_region_to_grasp
         T_grasp_base = np.asarray(T_base_cam, dtype=np.float64) @ T_grasp_cam
+
         pregrasp_xyz = _parse_csv_floats(self.args.pregrasp_offset_mm, 3) * 0.001
         grasp_xyz = _parse_csv_floats(self.args.grasp_offset_mm, 3) * 0.001
         T_base_pregrasp = T_grasp_base @ _make_T_from_xyz_m(pregrasp_xyz)
         T_base_grasp = T_grasp_base @ _make_T_from_xyz_m(grasp_xyz)
+
         print("[grasp-ref] T_region_to_camera=" + np.array2string(T_region_cam, precision=5, suppress_small=True))
         print("[grasp-ref] T_region_to_grasp=" + np.array2string(T_region_to_grasp, precision=5, suppress_small=True))
         print("[grasp-ref] T_grasp_to_camera=" + np.array2string(T_grasp_cam, precision=5, suppress_small=True))
         print("[grasp-ref] T_grasp_to_base=" + np.array2string(T_grasp_base, precision=5, suppress_small=True))
         print("[grasp-ref] T_base_pregrasp=" + np.array2string(T_base_pregrasp, precision=5, suppress_small=True))
         print("[grasp-ref] T_base_grasp=" + np.array2string(T_base_grasp, precision=5, suppress_small=True))
-        return {
-            "T_base_pregrasp": T_base_pregrasp,
-            "T_base_grasp": T_base_grasp,
-            "T_region_cam": T_region_cam,
-            "T_grasp_cam": T_grasp_cam,
-            "T_grasp_base": T_grasp_base,
-            "T_source_to_region": T_source_to_region,
-            "icp_final_pose_source": self._last_icp_pose_source,
-            "icp_quality": dict(self._last_icp_quality),
-        }
+        return T_base_pregrasp, T_base_grasp, T_region_cam, T_grasp_cam, T_grasp_base
+
+
+__all__ = ["ICPBackend"]
+
