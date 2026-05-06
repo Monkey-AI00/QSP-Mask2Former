@@ -6,7 +6,8 @@ from pathlib import Path
 __all__ = []
 
 _PROJECTS = {
-    "point_rend": "PointRend",
+    # This fork vendors PointRend under projects/CV/point_rend (not projects/PointRend/point_rend).
+    "point_rend": "CV",
     "deeplab": "DeepLab",
     "panoptic_deeplab": "Panoptic-DeepLab",
 }

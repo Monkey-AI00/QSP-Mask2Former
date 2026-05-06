@@ -70,6 +70,22 @@ def load_plug_json(json_file, image_root, dataset_name):
     return filtered_dicts
 
 
+def _subdirs_containing_json(root_dir, json_basename, max_show=25):
+    """列出 root_dir 下哪些一级子目录中含有 json_basename（用于提示路径写错）。"""
+    root_dir = os.path.abspath(root_dir)
+    if not os.path.isdir(root_dir):
+        return []
+    out = []
+    try:
+        for name in sorted(os.listdir(root_dir)):
+            sub = os.path.join(root_dir, name)
+            if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, json_basename)):
+                out.append(sub)
+    except OSError:
+        return []
+    return out[:max_show]
+
+
 def register_plug_dataset(dataset_root=None, dataset_name="plug_train", json_filename="plug_train.json"):
     """注册 plug 数据集，返回 `(dataset_name, num_classes)`。"""
     if dataset_root is None:
@@ -81,7 +97,15 @@ def register_plug_dataset(dataset_root=None, dataset_name="plug_train", json_fil
 
     # 检查文件是否存在
     if not os.path.exists(json_file):
-        raise FileNotFoundError(f"❌ 错误: 找不到 JSON 标注文件: {json_file}")
+        msg = f"❌ 错误: 找不到 JSON 标注文件: {json_file}"
+        candidates = _subdirs_containing_json(dataset_root, str(json_filename))
+        if candidates:
+            msg += (
+                f"\n\n当前目录下没有 {json_filename}，但在其子目录中找到以下候选"
+                f"（请把 --train-dataset-root / --val-dataset-root 指到其中**包含图片与 json 的那一层**）：\n"
+            )
+            msg += "\n".join(f"  - {p}" for p in candidates)
+        raise FileNotFoundError(msg)
     if not os.path.exists(image_root):
         raise FileNotFoundError(f"❌ 错误: 找不到图片目录: {image_root}")
     

@@ -5,7 +5,8 @@ Mask2Former 在 plug 数据集上的训练脚本（风格对齐 train_maskrcnn_p
 你需要准备：
 1) 安装依赖：
    - Detectron2（建议源码安装）
-   - Mask2Former（当前工程默认从仓库同级目录 `../Mask2Former` 查找）
+   - Mask2Former（默认与 Detectron2 仓库同父目录下的 `Mask2Former/`；也可用环境变量 `MASK2FORMER_ROOT`）
+   - 顶层工程目录可用 `WORKSPACE_ROOT` 指定（与默认数据集路径一致）
    - pip install -r ../Mask2Former/requirements.txt
 2) 编译 MSDeformAttn CUDA 扩展（必须，否则无法训练）：
    cd ../Mask2Former/mask2former/modeling/pixel_decoder/ops
@@ -46,18 +47,35 @@ warnings.filterwarnings(
     message=r".*torch\.meshgrid.*indexing argument.*",
 )
 
-# 添加 detectron2 到路径（必须指向 detectron2 仓库根目录）
-_D2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-if _D2_ROOT not in sys.path:
-    sys.path.insert(0, _D2_ROOT)
+# 本脚本位于 projects/CV/train/，向上三级才是 Detectron2 仓库根（含 detectron2/ 与 projects/）。
+_TRAIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_D2_REPO_ROOT = os.path.abspath(os.path.join(_TRAIN_DIR, "..", "..", ".."))
+if _D2_REPO_ROOT not in sys.path:
+    sys.path.insert(0, _D2_REPO_ROOT)
 
-# 当前仓库结构：
-# - workspace/src/detectron2
-# - ../Mask2Former
-_WORKSPACE_ROOT = os.path.abspath(os.path.join(_D2_ROOT, "..", ".."))
 
-# 添加 Mask2Former 到路径
-_M2F_ROOT = os.path.abspath(os.path.join(_WORKSPACE_ROOT, "..", "Mask2Former"))
+def _resolve_workspace_root() -> str:
+    env = os.environ.get("WORKSPACE_ROOT", "").strip()
+    if env:
+        return os.path.abspath(env)
+    p = Path(_D2_REPO_ROOT).resolve()
+    parts = p.parts
+    if len(parts) >= 2 and parts[-2] == "src" and parts[-1] == "detectron2":
+        return str(p.parent.parent)
+    if parts and parts[-1] == "detectron2":
+        return str(p.parent)
+    return str(p.parent)
+
+
+def _resolve_mask2former_root() -> str:
+    env = os.environ.get("MASK2FORMER_ROOT", "").strip()
+    if env:
+        return os.path.abspath(env)
+    return os.path.abspath(os.path.join(_D2_REPO_ROOT, "..", "Mask2Former"))
+
+
+_WORKSPACE_ROOT = _resolve_workspace_root()
+_M2F_ROOT = _resolve_mask2former_root()
 if _M2F_ROOT not in sys.path:
     sys.path.insert(0, _M2F_ROOT)
 
@@ -229,6 +247,17 @@ if __name__ == "__main__":
         args.train_dataset_name = str(args.dataset_name).strip()
     if str(getattr(args, "json_file", "")).strip():
         args.train_json_file = str(args.json_file).strip()
+
+    # 常见失误：shell 里未 export DATASET_NAME，导致 ${DATASET_NAME}_train 变成字面量 _train
+    _tn = str(getattr(args, "train_dataset_name", "")).strip()
+    _vn = str(getattr(args, "val_dataset_name", "")).strip()
+    if _tn == "_train" or _vn == "_val":
+        raise ValueError(
+            "训练/验证集名称异常（_train / _val），通常是未设置环境变量 DATASET_NAME，"
+            "命令行里的 ${DATASET_NAME}_train 与 .../gangkou/${DATASET_NAME} 被展开为空。\n"
+            "请先执行：export DATASET_NAME=<数据子目录名>  "
+            "（例如 plug_train_merged_0422，对应 datasets/gangkou/plug_train_merged_0422/plug_train.json）。"
+        )
 
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
