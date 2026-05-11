@@ -187,10 +187,15 @@ def main(args):
     )
     args.train_dataset_name = train_dataset_name
 
-    # 注册验证集；若未显式提供，则回退到训练集
-    val_dataset_root = str(getattr(args, "val_dataset_root", "")).strip() or str(args.train_dataset_root)
-    val_dataset_name = str(getattr(args, "val_dataset_name", "")).strip() or f"{train_dataset_name}_val"
-    val_json_file = str(getattr(args, "val_json_file", "")).strip() or str(args.train_json_file)
+    # 注册验证集；必须显式提供，不再回退到训练集
+    val_dataset_root = str(getattr(args, "val_dataset_root", "")).strip()
+    val_dataset_name = str(getattr(args, "val_dataset_name", "")).strip()
+    val_json_file = str(getattr(args, "val_json_file", "")).strip()
+    if not val_dataset_root or not val_dataset_name or not val_json_file:
+        raise ValueError(
+            "未找到完整的验证集参数：--val-dataset-root / --val-dataset-name / --val-json-file 必须全部显式提供；"
+            "不再支持留空后自动回退到训练集。"
+        )
     val_dataset_name, val_num_classes = register_plug_dataset(
         val_dataset_root,
         val_dataset_name,
@@ -229,9 +234,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--train-dataset-name", default="plug_train1", help="训练集注册名称")
     parser.add_argument("--train-json-file", default="plug_train.json", help="训练集 COCO 标注文件名")
-    parser.add_argument("--val-dataset-root", default="", help="验证集目录（留空则回退到训练集目录）")
-    parser.add_argument("--val-dataset-name", default="", help="验证集注册名称（留空则自动生成）")
-    parser.add_argument("--val-json-file", default="", help="验证集 COCO 标注文件名（留空则回退到训练集 json）")
+    parser.add_argument("--val-dataset-root", default="", help="验证集目录（必须显式提供）")
+    parser.add_argument("--val-dataset-name", default="", help="验证集注册名称（必须显式提供）")
+    parser.add_argument("--val-json-file", default="", help="验证集 COCO 标注文件名（必须显式提供）")
     # 向后兼容旧参数名：若提供则覆盖 train 参数
     parser.add_argument("--dataset-root", default="", help="(兼容) 等价于 --train-dataset-root")
     parser.add_argument("--dataset-name", default="", help="(兼容) 等价于 --train-dataset-name")

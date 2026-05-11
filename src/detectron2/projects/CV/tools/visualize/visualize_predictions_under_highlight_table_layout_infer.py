@@ -28,6 +28,13 @@ from typing import Iterable, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# 允许在任意 cwd 下运行时，仍能导入 projects/CV/train/custom_heads.py
+_THIS_FILE = os.path.abspath(__file__)
+_CV_ROOT = os.path.abspath(os.path.join(os.path.dirname(_THIS_FILE), "..", ".."))
+_TRAIN_DIR = os.path.join(_CV_ROOT, "train")
+if _TRAIN_DIR not in sys.path:
+    sys.path.insert(0, _TRAIN_DIR)
+
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultPredictor

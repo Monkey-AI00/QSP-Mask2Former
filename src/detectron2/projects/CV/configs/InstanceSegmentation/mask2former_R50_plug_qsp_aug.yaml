@@ -2,12 +2,11 @@ _BASE_: "mask2former_R50_plug_qsp.yaml"
 
 MODEL:
   MASK_FORMER:
-    # Enable the newly generated 4-template prior bank for QSP.
-    # 与仓库内其它 plug QSP 配置一致；若本机目录不同，可用命令行覆盖：
-    # MODEL.MASK_FORMER.PRIOR_PATH /你的路径/plug_canonical_prior_bank_0422.npy
-    PRIOR_PATH: "/home/users1/sjw/cursor/workspace/outputs/gangkou/plug_prior/plug_canonical_prior_bank_0422.npy"
+    PRIOR_PATH: "/home/users1/sjw/cursor/workspace/outputs/gangkou/plug_prior/plug_canonical_prior_bank_0429.npy"
     PRIOR_USE_BANK: True
     PRIOR_BANK_SIZE: 4
+    PRIOR_ALPHA: 0.5
+    PRIOR_LOSS_WEIGHT: 0.5
 
 INPUT:
   DATASET_MAPPER_NAME: "plug_qsp_instance"

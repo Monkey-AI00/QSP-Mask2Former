@@ -6,6 +6,7 @@ PointRend 自定义数据集训练脚本
 
 import os
 import sys
+import importlib
 
 # 添加 detectron2 到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
@@ -18,6 +19,40 @@ from detectron2.engine import DefaultTrainer, default_argument_parser, default_s
 from detectron2.evaluation import COCOEvaluator, DatasetEvaluators
 import detectron2.data.transforms as T
 from detectron2.data import DatasetMapper, build_detection_train_loader
+
+
+def _prepare_shape_prior_env(shape_prior_npy: str) -> str:
+    """确保 ShapeAwareCoarseMaskHead 已注册，并解析/设置 SHAPE_PRIOR_PATH。"""
+    try:
+        custom_heads = importlib.import_module("custom_heads")
+    except Exception as e:
+        raise RuntimeError(
+            "导入 custom_heads 失败，无法启用 ShapeAwareCoarseMaskHead。"
+        ) from e
+
+    provided = str(shape_prior_npy).strip()
+    env_prior = str(os.environ.get("SHAPE_PRIOR_PATH", "")).strip()
+    if provided:
+        prior_path = os.path.abspath(provided)
+    elif env_prior:
+        prior_path = os.path.abspath(env_prior)
+    else:
+        default_prior_fn = getattr(custom_heads, "_default_prior_path", None)
+        if callable(default_prior_fn):
+            prior_path = os.path.abspath(str(default_prior_fn()))
+        else:
+            raise RuntimeError(
+                "未提供 --shape-prior-npy，且 custom_heads 未暴露默认 prior 路径函数。"
+            )
+
+    if not os.path.isfile(prior_path):
+        raise FileNotFoundError(
+            f"❌ 找不到 shape prior 文件: {prior_path}\n"
+            "请传 --shape-prior-npy /abs/path/to/plug_canonical_prior.npy，"
+            "或先设置环境变量 SHAPE_PRIOR_PATH。"
+        )
+    os.environ["SHAPE_PRIOR_PATH"] = prior_path
+    return prior_path
 
 
 def load_plug_json(json_file, image_root, dataset_name):
@@ -168,6 +203,32 @@ def register_plug_dataset(dataset_root=None, dataset_name="plug_train", json_fil
     return dataset_name, num_classes
 
 
+def register_plug_train_val_datasets(
+    train_dataset_root=None,
+    val_dataset_root=None,
+    train_dataset_name="plug_train",
+    val_dataset_name="plug_val",
+    train_json_file="plug_train.json",
+    val_json_file="plug_val.json",
+):
+    """分别注册训练集与验证集，返回 (train_name, val_name, num_classes)。"""
+    train_name, train_num_classes = register_plug_dataset(
+        dataset_root=train_dataset_root,
+        dataset_name=train_dataset_name,
+        json_filename=train_json_file,
+    )
+    val_name, val_num_classes = register_plug_dataset(
+        dataset_root=val_dataset_root,
+        dataset_name=val_dataset_name,
+        json_filename=val_json_file,
+    )
+    if int(train_num_classes) != int(val_num_classes):
+        raise ValueError(
+            f"训练/验证类别数不一致: train={train_num_classes}, val={val_num_classes}"
+        )
+    return train_name, val_name, int(train_num_classes)
+
+
 class Trainer(DefaultTrainer):
     """自定义训练器"""
     
@@ -212,8 +273,9 @@ def setup(args):
     # ============================================
     # 📝 数据集配置
     # ============================================
-    cfg.DATASETS.TRAIN = ("plug_train",)
-    cfg.DATASETS.TEST = ("plug_train",) # 验证集
+    cfg.DATASETS.TRAIN = (str(args.train_dataset_name),)
+    cfg.DATASETS.TEST = (str(args.val_dataset_name),)  # 验证集
+    cfg.MODEL.ROI_MASK_HEAD.NAME = "ShapeAwareCoarseMaskHead"
     
     # 设置输出目录
     if not hasattr(args, 'output_dir') or args.output_dir is None:
@@ -225,9 +287,8 @@ def setup(args):
     # 🔧 关键修正：确保类别数量正确
     # ============================================
     # PointRend 需要显式指定类别数（不含背景）
-    # 您的数据集似乎只有 1 类 (plug)
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1 
-    cfg.MODEL.POINT_HEAD.NUM_CLASSES = 1 # PointRend 特有的头部也需要设置
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = int(args.num_classes)
+    cfg.MODEL.POINT_HEAD.NUM_CLASSES = int(args.num_classes)  # PointRend 特有的头部也需要设置
     
     # 设置设备
     import torch
@@ -249,7 +310,23 @@ def setup(args):
 
 
 def main(args):
-    register_plug_dataset()
+    effective_prior = _prepare_shape_prior_env(args.shape_prior_npy)
+    print(f"[train_plug] SHAPE_PRIOR_PATH={effective_prior}")
+
+    train_dataset_root = args.train_dataset_root or args.dataset_root
+    val_dataset_root = args.val_dataset_root or args.dataset_root
+
+    train_dataset_name, val_dataset_name, num_classes = register_plug_train_val_datasets(
+        train_dataset_root=train_dataset_root,
+        val_dataset_root=val_dataset_root,
+        train_dataset_name=args.train_dataset_name,
+        val_dataset_name=args.val_dataset_name,
+        train_json_file=args.train_json_file,
+        val_json_file=args.val_json_file,
+    )
+    args.train_dataset_name = train_dataset_name
+    args.val_dataset_name = val_dataset_name
+    args.num_classes = num_classes
     
     cfg = setup(args)
     
@@ -269,6 +346,35 @@ def main(args):
 
 if __name__ == "__main__":
     parser = default_argument_parser()
+    parser.add_argument(
+        "--dataset-root",
+        default="/home/users1/sjw/cursor/Yolo_pointrend/plug_train",
+        help="统一数据目录（不传 train/val 独立目录时，train/val 都使用该目录）",
+    )
+    parser.add_argument(
+        "--train-dataset-root",
+        default=None,
+        help="训练集数据目录（兼容旧参数；优先级高于 --dataset-root）",
+    )
+    parser.add_argument(
+        "--val-dataset-root",
+        default=None,
+        help="验证集数据目录（兼容旧参数；优先级高于 --dataset-root）",
+    )
+    parser.add_argument("--train-dataset-name", default="plug_train", help="训练集注册名称")
+    parser.add_argument("--val-dataset-name", default="plug_val", help="验证集注册名称")
+    parser.add_argument("--train-json-file", default="plug_train.json", help="训练集 COCO 标注文件名")
+    parser.add_argument("--val-json-file", default="plug_val.json", help="验证集 COCO 标注文件名")
+    parser.add_argument(
+        "--shape-prior-npy",
+        default="",
+        help="shape prior 的 .npy 路径；不传则依次尝试 SHAPE_PRIOR_PATH 和 custom_heads 默认路径",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="训练输出目录（等价于 cfg.OUTPUT_DIR）",
+    )
     parser.add_argument(
         "--gpu-id",
         type=int,
