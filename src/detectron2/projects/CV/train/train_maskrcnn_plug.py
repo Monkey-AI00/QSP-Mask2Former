@@ -106,6 +106,28 @@ def _read_last_checkpoint_path(output_dir: str) -> Optional[str]:
         return None
 
 
+def register_plug_train_val_datasets(
+    train_dataset_root=None,
+    val_dataset_root=None,
+    train_dataset_name="plug_train",
+    val_dataset_name="plug_val",
+    train_json_file="plug_train.json",
+    val_json_file="plug_val.json",
+):
+    """分别注册训练集与验证集，返回 (train_name, val_name, num_classes)。"""
+    train_name, train_num_classes = register_plug_dataset(
+        train_dataset_root, train_dataset_name, train_json_file
+    )
+    val_name, val_num_classes = register_plug_dataset(
+        val_dataset_root, val_dataset_name, val_json_file
+    )
+    if int(train_num_classes) != int(val_num_classes):
+        raise ValueError(
+            f"训练/验证类别数不一致: train={train_num_classes}, val={val_num_classes}"
+        )
+    return train_name, val_name, int(train_num_classes)
+
+
 def setup(args):
     cfg = get_cfg()
     cfg.merge_from_file(args.config_file)
@@ -113,8 +135,8 @@ def setup(args):
 
     cfg.defrost()
     # 由注册数据集后填入
-    cfg.DATASETS.TRAIN = (str(args.dataset_name),)
-    cfg.DATASETS.TEST = (str(args.dataset_name),)
+    cfg.DATASETS.TRAIN = (str(args.train_dataset_name),)
+    cfg.DATASETS.TEST = (str(args.val_dataset_name),)
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = int(args.num_classes)
 
     # 初始化权重（推荐用 COCO 预训练 Mask R-CNN）
@@ -145,7 +167,8 @@ def setup(args):
     try:
         print("=" * 70)
         print("[maskrcnn][setup] config_file:", str(args.config_file))
-        print("[maskrcnn][setup] dataset_name:", str(args.dataset_name))
+        print("[maskrcnn][setup] train_dataset_name:", str(args.train_dataset_name))
+        print("[maskrcnn][setup] val_dataset_name:", str(args.val_dataset_name))
         print("[maskrcnn][setup] num_classes:", int(args.num_classes))
         print("[maskrcnn][setup] device:", str(cfg.MODEL.DEVICE))
         print("[maskrcnn][setup] output_dir:", str(cfg.OUTPUT_DIR))
@@ -166,8 +189,18 @@ def setup(args):
 
 def main(args):
     print("[maskrcnn] starting training entry...")
-    dataset_name, num_classes = register_plug_dataset(args.dataset_root, args.dataset_name, args.json_file)
-    args.dataset_name = dataset_name
+    train_dataset_root = args.train_dataset_root or args.dataset_root
+    val_dataset_root = args.val_dataset_root or args.dataset_root
+    train_dataset_name, val_dataset_name, num_classes = register_plug_train_val_datasets(
+        train_dataset_root=train_dataset_root,
+        val_dataset_root=val_dataset_root,
+        train_dataset_name=args.train_dataset_name,
+        val_dataset_name=args.val_dataset_name,
+        train_json_file=args.train_json_file,
+        val_json_file=args.val_json_file,
+    )
+    args.train_dataset_name = train_dataset_name
+    args.val_dataset_name = val_dataset_name
     args.num_classes = num_classes
 
     # 解析/下载权重（如果是 detectron2://... 会自动下载到本机缓存）
@@ -233,10 +266,38 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset-root",
         default=os.path.join(_WORKSPACE_ROOT, "datasets", "plug_train1"),
-        help="数据集目录（包含图片与 COCO json）",
+        help="统一数据目录（不传 train/val 独立目录时，train/val 都使用该目录）",
     )
-    parser.add_argument("--dataset-name", default="plug_train1", help="注册到 detectron2 的数据集名称")
-    parser.add_argument("--json-file", default="plug_train.json", help="COCO 标注文件名（相对 dataset-root）")
+    parser.add_argument(
+        "--train-dataset-root",
+        default=None,
+        help="训练集数据目录（优先级高于 --dataset-root）",
+    )
+    parser.add_argument(
+        "--val-dataset-root",
+        default=None,
+        help="验证集数据目录（优先级高于 --dataset-root）",
+    )
+    parser.add_argument(
+        "--train-dataset-name",
+        default="plug_train",
+        help="训练集注册到 detectron2 的名称",
+    )
+    parser.add_argument(
+        "--val-dataset-name",
+        default="plug_val",
+        help="验证集注册到 detectron2 的名称",
+    )
+    parser.add_argument(
+        "--train-json-file",
+        default="plug_train.json",
+        help="训练集 COCO 标注文件名（相对 train-dataset-root）",
+    )
+    parser.add_argument(
+        "--val-json-file",
+        default="plug_val.json",
+        help="验证集 COCO 标注文件名（相对 val-dataset-root）",
+    )
     parser.add_argument(
         "--weights",
         default="",

@@ -22,34 +22,24 @@ from detectron2.data import DatasetMapper, build_detection_train_loader
 
 
 def _prepare_shape_prior_env(shape_prior_npy: str) -> str:
-    """确保 ShapeAwareCoarseMaskHead 已注册，并解析/设置 SHAPE_PRIOR_PATH。"""
+    """仅在用户显式提供 prior 时启用 PointRend+prior。"""
+    provided = str(shape_prior_npy).strip()
+    if not provided:
+        return ""
+
     try:
-        custom_heads = importlib.import_module("custom_heads")
+        importlib.import_module("custom_heads")
     except Exception as e:
         raise RuntimeError(
             "导入 custom_heads 失败，无法启用 ShapeAwareCoarseMaskHead。"
         ) from e
 
-    provided = str(shape_prior_npy).strip()
-    env_prior = str(os.environ.get("SHAPE_PRIOR_PATH", "")).strip()
-    if provided:
-        prior_path = os.path.abspath(provided)
-    elif env_prior:
-        prior_path = os.path.abspath(env_prior)
-    else:
-        default_prior_fn = getattr(custom_heads, "_default_prior_path", None)
-        if callable(default_prior_fn):
-            prior_path = os.path.abspath(str(default_prior_fn()))
-        else:
-            raise RuntimeError(
-                "未提供 --shape-prior-npy，且 custom_heads 未暴露默认 prior 路径函数。"
-            )
+    prior_path = os.path.abspath(provided)
 
     if not os.path.isfile(prior_path):
         raise FileNotFoundError(
             f"❌ 找不到 shape prior 文件: {prior_path}\n"
-            "请传 --shape-prior-npy /abs/path/to/plug_canonical_prior.npy，"
-            "或先设置环境变量 SHAPE_PRIOR_PATH。"
+            "请传 --shape-prior-npy /abs/path/to/plug_canonical_prior.npy。"
         )
     os.environ["SHAPE_PRIOR_PATH"] = prior_path
     return prior_path
@@ -275,7 +265,10 @@ def setup(args):
     # ============================================
     cfg.DATASETS.TRAIN = (str(args.train_dataset_name),)
     cfg.DATASETS.TEST = (str(args.val_dataset_name),)  # 验证集
-    cfg.MODEL.ROI_MASK_HEAD.NAME = "ShapeAwareCoarseMaskHead"
+    if bool(getattr(args, "use_shape_prior", False)):
+        cfg.MODEL.ROI_MASK_HEAD.NAME = "ShapeAwareCoarseMaskHead"
+    else:
+        cfg.MODEL.ROI_MASK_HEAD.NAME = "PointRendMaskHead"
     
     # 设置输出目录
     if not hasattr(args, 'output_dir') or args.output_dir is None:
@@ -311,7 +304,11 @@ def setup(args):
 
 def main(args):
     effective_prior = _prepare_shape_prior_env(args.shape_prior_npy)
-    print(f"[train_plug] SHAPE_PRIOR_PATH={effective_prior}")
+    args.use_shape_prior = bool(effective_prior)
+    if args.use_shape_prior:
+        print(f"[train_plug] mode=PointRend+prior, SHAPE_PRIOR_PATH={effective_prior}")
+    else:
+        print("[train_plug] mode=PointRend (no prior)")
 
     train_dataset_root = args.train_dataset_root or args.dataset_root
     val_dataset_root = args.val_dataset_root or args.dataset_root
@@ -368,7 +365,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--shape-prior-npy",
         default="",
-        help="shape prior 的 .npy 路径；不传则依次尝试 SHAPE_PRIOR_PATH 和 custom_heads 默认路径",
+        help="shape prior 的 .npy 路径（仅当训练 PointRend+prior 时传入；留空则训练标准 PointRend）",
     )
     parser.add_argument(
         "--output-dir",
