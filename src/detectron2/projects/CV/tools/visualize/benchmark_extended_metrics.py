@@ -80,10 +80,93 @@ from detectron2.projects.point_rend import add_pointrend_config
 from detectron2.config import CfgNode
 
 # 触发注册：ShapeAwareCoarseMaskHead
-import custom_heads  # noqa: F401
+try:
+    import custom_heads  # noqa: F401
+except ModuleNotFoundError:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    _CV_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
+    _TRAIN_DIR = os.path.join(_CV_ROOT, "train")
+    if _TRAIN_DIR not in sys.path:
+        sys.path.insert(0, _TRAIN_DIR)
+    import custom_heads  # noqa: F401
 
-from highlight_mapper import HighlightAugConfig, apply_synthetic_highlight, _ann_to_mask  # type: ignore
-from train_plug import register_plug_dataset
+try:
+    from train_plug import register_plug_dataset
+except ModuleNotFoundError:
+    from train.train_plug import register_plug_dataset
+
+try:
+    from highlight_mapper import HighlightAugConfig, apply_synthetic_highlight, _ann_to_mask  # type: ignore
+except ModuleNotFoundError:
+    @dataclass
+    class HighlightAugConfig:
+        prob: float = 0.0
+        spots_range: Tuple[int, int] = (1, 3)
+        sigma_range: Tuple[int, int] = (30, 80)
+        intensity_range: Tuple[int, int] = (150, 255)
+        focus_on_object: bool = False
+        object_bbox_shrink: float = 0.0
+        clip_to_object: bool = False
+        object_mask_dilate: int = 0
+        object_mask_feather: int = 0
+
+    def _ann_to_mask(ann: dict, h: int, w: int) -> np.ndarray:
+        seg = ann.get("segmentation", None)
+        out = np.zeros((h, w), dtype=np.uint8)
+        if isinstance(seg, list) and len(seg) > 0:
+            for poly in seg:
+                if not isinstance(poly, list) or len(poly) < 6:
+                    continue
+                pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+                pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+                pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+                cv2.fillPoly(out, [pts.astype(np.int32)], color=1)
+            if np.any(out > 0):
+                return out
+
+        bbox = ann.get("bbox", None)
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            x, y, bw, bh = [float(v) for v in bbox[:4]]
+            x1 = int(max(0, min(w - 1, round(x))))
+            y1 = int(max(0, min(h - 1, round(y))))
+            x2 = int(max(0, min(w - 1, round(x + bw - 1))))
+            y2 = int(max(0, min(h - 1, round(y + bh - 1))))
+            if x2 >= x1 and y2 >= y1:
+                out[y1 : y2 + 1, x1 : x2 + 1] = 1
+        return out
+
+    def apply_synthetic_highlight(img_rgb: np.ndarray, cfg: HighlightAugConfig, dataset_dict: Optional[dict] = None) -> np.ndarray:
+        if img_rgb is None or img_rgb.size == 0:
+            return img_rgb
+        if float(cfg.prob) <= 0.0 or random.random() > float(cfg.prob):
+            return img_rgb
+
+        h, w = img_rgb.shape[:2]
+        heat = np.zeros((h, w), dtype=np.float32)
+
+        nmin, nmax = int(cfg.spots_range[0]), int(cfg.spots_range[1])
+        if nmax < nmin:
+            nmin, nmax = nmax, nmin
+        n_spots = max(1, random.randint(max(1, nmin), max(1, nmax)))
+
+        ys, xs = np.mgrid[0:h, 0:w]
+        s0, s1 = int(cfg.sigma_range[0]), int(cfg.sigma_range[1])
+        if s1 < s0:
+            s0, s1 = s1, s0
+        i0, i1 = int(cfg.intensity_range[0]), int(cfg.intensity_range[1])
+        if i1 < i0:
+            i0, i1 = i1, i0
+
+        for _ in range(n_spots):
+            cx = random.uniform(0, max(1, w - 1))
+            cy = random.uniform(0, max(1, h - 1))
+            sigma = float(max(1, random.randint(max(1, s0), max(1, s1))))
+            amp = float(max(0, random.randint(max(0, i0), max(0, i1))))
+            g = np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2.0 * sigma * sigma))
+            heat += amp * g.astype(np.float32)
+
+        out = img_rgb.astype(np.float32) + heat[..., None]
+        return np.clip(out, 0, 255).astype(np.uint8)
 
 
 @dataclass
@@ -369,6 +452,28 @@ def parse_args() -> argparse.Namespace:
         "--speed-cuda-sync",
         action="store_true",
         help="速度计时前后调用 torch.cuda.synchronize()（CUDA 下更准确，但略慢）。",
+    )
+    p.add_argument(
+        "--export-severity-s1",
+        action="store_true",
+        help="在评测结束后调用 severity_table_s1.py，导出 Table S1 统计（CSV/MD/manifest）。",
+    )
+    p.add_argument(
+        "--severity-tau",
+        type=int,
+        default=245,
+        help="Table S1 统计时，Y 通道高光阈值 tau（判定 Y>tau）。",
+    )
+    p.add_argument(
+        "--severity-roi-source",
+        choices=["mask", "bbox"],
+        default="mask",
+        help="Table S1 统计时 ROI 来源：mask 或 bbox。",
+    )
+    p.add_argument(
+        "--severity-bin-edges",
+        default="",
+        help="可选：逗号分隔分箱边界（长度=severity数+1）；留空则按 severity 中点自动生成。",
     )
     return p.parse_args()
 
@@ -757,6 +862,33 @@ def _eval_transfiner_subprocess(
     ]
     cp = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if cp.returncode != 0:
+        stderr_text = str(cp.stderr or "")
+        if ("No module named 'kornia'" in stderr_text) or ('No module named "kornia"' in stderr_text):
+            print(
+                "[WARN] transfiner eval skipped: missing dependency 'kornia' in runtime env. "
+                "Install it in the same python env to enable MaskTransfiner metrics."
+            )
+            return {
+                "bbox_AP": float("nan"),
+                "segm_AP": float("nan"),
+                "boundary_iou": float("nan"),
+                "hd95": float("nan"),
+                "skipped": True,
+                "skip_reason": "missing_kornia",
+            }
+        if ("CUDA out of memory" in stderr_text) or ("torch.OutOfMemoryError" in stderr_text):
+            print(
+                "[WARN] transfiner eval skipped: CUDA OOM in subprocess. "
+                "Please free GPU memory / switch GPU / reduce Transfiner eval load."
+            )
+            return {
+                "bbox_AP": float("nan"),
+                "segm_AP": float("nan"),
+                "boundary_iou": float("nan"),
+                "hd95": float("nan"),
+                "skipped": True,
+                "skip_reason": "cuda_oom",
+            }
         raise RuntimeError(
             "transfiner eval subprocess failed\n"
             f"cmd: {' '.join(cmd)}\n"
@@ -870,6 +1002,63 @@ def _plot_curves(rows: List[dict], out_dir: str) -> None:
     plot_metric("bbox_AP", "COCO bbox AP", "curve_bbox_ap.png")
     plot_metric("boundary_iou", "Boundary IoU (mean)", "curve_boundary_iou.png")
     plot_metric("hd95", "HD95 (px, mean, lower=better)", "curve_hd95.png", invert=False)
+
+
+def _run_severity_table_s1(
+    *,
+    clean_root: str,
+    json_file: str,
+    out_tables_dir: str,
+    cache_dir: str,
+    severities: List[float],
+    tau: int,
+    roi_source: str,
+    bin_edges: str,
+    seed: int,
+) -> None:
+    """
+    调用 severity_table_s1.py 生成 Table S1 统计：
+    - 视图A：Y通道 r 分箱统计
+    - 视图B：pipeline highlight_s* 目录统计
+    - 映射摘要：pipeline_severity vs y_assigned_severity
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "severity_table_s1.py")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"severity_table_s1.py not found: {script}")
+    cmd = [
+        sys.executable,
+        "-u",
+        script,
+        "--dataset-root",
+        os.path.abspath(str(clean_root)),
+        "--json-file",
+        str(json_file),
+        "--out-dir",
+        os.path.abspath(str(out_tables_dir)),
+        "--tau",
+        str(int(tau)),
+        "--roi-source",
+        str(roi_source),
+        "--severities",
+    ] + [str(float(s)) for s in severities] + [
+        "--pipeline-root",
+        os.path.abspath(str(cache_dir)),
+        "--seed",
+        str(int(seed)),
+    ]
+    if str(bin_edges).strip():
+        cmd += ["--bin-edges", str(bin_edges).strip()]
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            "severity_table_s1.py failed\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stdout:\n{cp.stdout}\n"
+            f"stderr:\n{cp.stderr}\n"
+        )
+    print("[S1] severity table generated")
+    if str(cp.stdout).strip():
+        print(cp.stdout.strip())
 
 
 def main() -> None:
@@ -1215,6 +1404,19 @@ def main() -> None:
 
     with open(os.path.join(tables_dir, "robustness_delta.json"), "w") as f:
         json.dump(delta_rows, f, indent=2)
+
+    if bool(getattr(args, "export_severity_s1", False)):
+        _run_severity_table_s1(
+            clean_root=str(args.clean_root),
+            json_file=str(args.json_file),
+            out_tables_dir=str(tables_dir),
+            cache_dir=str(cache_dir),
+            severities=[float(s) for s in args.severities],
+            tau=int(getattr(args, "severity_tau", 245)),
+            roi_source=str(getattr(args, "severity_roi_source", "mask")),
+            bin_edges=str(getattr(args, "severity_bin_edges", "")),
+            seed=int(getattr(args, "seed", 0)),
+        )
 
     # plots
     _plot_curves(rows, plots_dir)
