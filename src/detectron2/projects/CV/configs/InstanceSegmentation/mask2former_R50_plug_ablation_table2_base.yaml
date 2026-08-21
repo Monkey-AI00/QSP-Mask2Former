@@ -1,0 +1,7 @@
+_BASE_: "mask2former_R50_plug_qsp_aug.yaml"
+
+MODEL:
+  MASK_FORMER:
+    # Table-2 row: Base (Mask2Former)
+    PRIOR_ON: False
+

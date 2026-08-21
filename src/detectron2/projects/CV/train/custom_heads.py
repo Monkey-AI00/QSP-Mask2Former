@@ -30,9 +30,16 @@ from detectron2.projects.point_rend import ShapePriorAdapter
 
 
 def _default_prior_path() -> str:
-    # 默认指向当前仓库下 outputs/plug_prior/plug_canonical_prior.npy（Phase-1 输出）
-    here = os.path.dirname(os.path.abspath(__file__))  # .../detectron2/projects/PointRend
-    return os.path.abspath(os.path.join(here, "..", "..", "..", "..", "outputs", "plug_prior", "plug_canonical_prior.npy"))
+    # 默认指向工作区 outputs/plug_prior/plug_canonical_prior.npy（Phase-1 输出）
+    # 优先使用 WORKSPACE_ROOT，其次按当前文件路径回溯到 workspace 根目录。
+    ws = os.environ.get("WORKSPACE_ROOT", "").strip()
+    if ws:
+        return os.path.abspath(os.path.join(ws, "outputs", "plug_prior", "plug_canonical_prior.npy"))
+
+    here = os.path.dirname(os.path.abspath(__file__))  # .../workspace/src/detectron2/projects/CV/train
+    return os.path.abspath(
+        os.path.join(here, "..", "..", "..", "..", "..", "outputs", "plug_prior", "plug_canonical_prior.npy")
+    )
 
 
 @ROI_MASK_HEAD_REGISTRY.register()
@@ -111,17 +118,34 @@ class ShapeAwareCoarseMaskHead(PointRendMaskHead):
                 self._shape_debug_top_idx = None
 
             if self._shape_debug:
+                self.shape_debug_cache = {}
+            raw_coarse_mask = None
+            if self._shape_debug:
+                # Raw branch: apply the original coarse head to the unrefined
+                # ROI features before ShapePriorAdapter changes them.
+                raw_coarse_mask = self.coarse_head(roi_features)
+                if len(instances) == 1:
+                    # Run the complete PointRend subdivision on a copy of the
+                    # instances so the raw branch does not overwrite outputs.
+                    raw_instances = [instances[0][:]]
+                    self._subdivision_inference(
+                        features,
+                        raw_coarse_mask,
+                        raw_instances,
+                        debug_prefix="raw_",
+                    )
+            if self._shape_debug:
                 debug_out = self.shape_adapter(roi_features, return_debug=True)
                 roi_features = debug_out.x_out
                 # store only top instance to keep memory small
                 idx = self._shape_debug_top_idx
                 if idx is None:
                     idx = 0
-                self.shape_debug_cache = {
+                self.shape_debug_cache.update({
                     "pred_angle": debug_out.pred_angle[idx : idx + 1].detach().float().cpu(),
                     "rotated_prior": debug_out.rotated_prior[idx : idx + 1].detach().float().cpu(),
                     "gate_map": debug_out.gate_map[idx : idx + 1].detach().float().cpu(),  # (1,1,H,W)
-                }
+                })
                 # refined feature (channel mean), for visualization only
                 try:
                     fm = debug_out.x_out[idx : idx + 1].detach().float().mean(dim=1, keepdim=True).cpu()  # (1,1,H,W)
@@ -135,10 +159,14 @@ class ShapeAwareCoarseMaskHead(PointRendMaskHead):
                 idx = self._shape_debug_top_idx
                 if idx is None:
                     idx = 0
+                if raw_coarse_mask is not None:
+                    self.shape_debug_cache["raw_coarse_mask_logits"] = (
+                        raw_coarse_mask[idx : idx + 1].detach().float().cpu()
+                    )
                 self.shape_debug_cache["coarse_mask_logits"] = coarse_mask[idx : idx + 1].detach().float().cpu()
             return self._subdivision_inference(features, coarse_mask, instances)
 
-    def _subdivision_inference(self, features, mask_representations, instances):
+    def _subdivision_inference(self, features, mask_representations, instances, debug_prefix: str = ""):
         """
         Same as PointRendMaskHead._subdivision_inference, but optionally cache
         upsample intermediates for visualization.
@@ -214,7 +242,7 @@ class ShapeAwareCoarseMaskHead(PointRendMaskHead):
                 )
                 # store refined mask at this upsample resolution
                 try:
-                    self.shape_debug_cache[f"mask_logits_upsample{upsample_k}"] = (
+                    self.shape_debug_cache[f"{debug_prefix}mask_logits_upsample{upsample_k}"] = (
                         mask_logits[debug_idx : debug_idx + 1].detach().float().cpu()
                     )
                 except Exception:
@@ -222,7 +250,9 @@ class ShapeAwareCoarseMaskHead(PointRendMaskHead):
 
         # final
         try:
-            self.shape_debug_cache["mask_logits_final"] = mask_logits[debug_idx : debug_idx + 1].detach().float().cpu()
+            self.shape_debug_cache[f"{debug_prefix}mask_logits_final"] = (
+                mask_logits[debug_idx : debug_idx + 1].detach().float().cpu()
+            )
         except Exception:
             pass
 

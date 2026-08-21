@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XOR 局部放大可视化（仅 Raw + GT + XOR Zoom）：
+XOR 可视化（仅 Raw + GT + XOR）：
 
 - 不输出实例分割叠加图（Pred Overlay）
 - 保留 Raw 图与 GT 图
-- 每个方法只输出 XOR 误差局部放大图
+- 每个方法输出 XOR 误差图（全图）
+- 可选：额外输出局部放大 + 文字说明图
 - 固定颜色：FP=红色，FN=蓝色
 """
 
@@ -44,10 +45,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--index-base", type=int, default=1, choices=(0, 1))
     p.add_argument("--score-thr", type=float, default=0.5)
     p.add_argument("--cell-width", type=int, default=520, help="每个格子目标宽度")
-    # 兼容旧命令：以下 3 个参数保留但不再生效（当前版本不做局部放大）
-    p.add_argument("--zoom-scale", type=float, default=2.5, help="已弃用：旧版 XOR 局部放大倍数（当前忽略）")
-    p.add_argument("--zoom-pad", type=int, default=20, help="已弃用：旧版局部框外扩像素（当前忽略）")
-    p.add_argument("--zoom-min-size", type=int, default=96, help="已弃用：旧版局部框最小边长（当前忽略）")
+    p.add_argument("--zoom-scale", type=float, default=2.5, help="局部放大倍数（仅在启用局部放大说明时生效）")
+    p.add_argument("--zoom-pad", type=int, default=20, help="局部框外扩像素（仅在启用局部放大说明时生效）")
+    p.add_argument("--zoom-min-size", type=int, default=96, help="局部框最小边长（仅在启用局部放大说明时生效）")
+    p.add_argument(
+        "--enable-local-zoom-notes",
+        action="store_true",
+        help="可选：额外生成局部放大+文字说明图（xor_zoom_local_notes.png）。",
+    )
+    p.add_argument(
+        "--local-zoom-rows",
+        default="1,3,4",
+        help="局部放大使用的行号（1-based，逗号分隔，例如 1,3,4）。",
+    )
+    p.add_argument(
+        "--local-zoom-methods",
+        default="Mask R-CNN,Mask2Former,QSP-M2F",
+        help="局部放大对比方法名（逗号分隔，未命中则自动忽略）。",
+    )
+    p.add_argument("--local-zoom-patch-w", type=int, default=280, help="局部放大片宽度")
+    p.add_argument("--local-zoom-patch-h", type=int, default=220, help="局部放大片高度")
+    p.add_argument("--local-zoom-row-gap", type=int, default=26, help="局部放大行间距")
     p.add_argument("--xor-alpha", type=float, default=0.82, help="XOR 颜色叠加透明度")
     p.add_argument("--xor-bg-dim", type=float, default=0.55, help="XOR 背景亮度系数")
 
@@ -129,6 +147,28 @@ def _crop_zoom(img: np.ndarray, box: Tuple[int, int, int, int], scale: float) ->
     return cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_NEAREST)
 
 
+def _parse_int_list_csv(s: str) -> List[int]:
+    out: List[int] = []
+    for t in str(s).split(","):
+        tt = t.strip()
+        if not tt:
+            continue
+        try:
+            out.append(int(tt))
+        except ValueError:
+            continue
+    return out
+
+
+def _parse_str_list_csv(s: str) -> List[str]:
+    out: List[str] = []
+    for t in str(s).split(","):
+        tt = t.strip()
+        if tt:
+            out.append(tt)
+    return out
+
+
 def _gt_panel(raw_bgr: np.ndarray, gt01: np.ndarray) -> np.ndarray:
     return base_vis._overlay_mask(raw_bgr, gt01, color_bgr=(0, 255, 0), alpha=0.38, outline=True)
 
@@ -154,7 +194,7 @@ def _make_xor_zoom_panel(
         alpha=float(xor_alpha),
         bg_dim=float(xor_bg_dim),
     )
-    # 当前版本不做局部放大，直接使用与 raw 同尺寸的 XOR 全图
+    # XOR 全图（与 raw 同尺寸）
     panel = xor_full.copy()
     cv2.putText(
         panel,
@@ -167,8 +207,152 @@ def _make_xor_zoom_panel(
         cv2.LINE_AA,
     )
 
-    panel = base_vis._title_bar(panel, f"{method_name} XOR Zoom")
+    panel = base_vis._title_bar(panel, f"{method_name} XOR")
     return panel, fp_px, fn_px
+
+
+def _compute_focus_box_multi(gt01: np.ndarray, preds: List[np.ndarray], pad: int, min_size: int) -> Tuple[int, int, int, int]:
+    if not preds:
+        return _compute_focus_box(gt01, np.zeros_like(gt01), pad, min_size)
+    err = np.zeros_like(gt01, dtype=np.uint8)
+    g = (gt01 > 0)
+    for pr in preds:
+        p = (pr > 0)
+        err = np.logical_or(err > 0, np.logical_xor(g, p)).astype(np.uint8)
+    return _compute_focus_box(gt01, err, pad, min_size)
+
+
+def _render_local_zoom_notes(
+    out_dir: str,
+    row_records: List[dict],
+    *,
+    rows_csv: str,
+    methods_csv: str,
+    patch_w: int,
+    patch_h: int,
+    row_gap: int,
+    zoom_scale: float,
+    zoom_pad: int,
+    zoom_min_size: int,
+) -> Optional[str]:
+    if not row_records:
+        return None
+
+    req_rows = _parse_int_list_csv(rows_csv)
+    req_methods = _parse_str_list_csv(methods_csv)
+    if not req_rows:
+        req_rows = [1, 3, 4]
+    if not req_methods:
+        req_methods = ["Mask R-CNN", "Mask2Former", "QSP-M2F"]
+
+    valid_rows: List[Tuple[int, dict]] = []
+    for ridx1 in req_rows:
+        ridx0 = ridx1 - 1
+        if 0 <= ridx0 < len(row_records):
+            valid_rows.append((ridx1, row_records[ridx0]))
+    if not valid_rows:
+        return None
+
+    # 以第一行可用方法为准过滤，避免画空列
+    first_methods = set(valid_rows[0][1].get("method_panels", {}).keys())
+    use_methods = [m for m in req_methods if m in first_methods]
+    if not use_methods:
+        use_methods = list(valid_rows[0][1].get("method_panels", {}).keys())[:3]
+    if not use_methods:
+        return None
+
+    margin = 18
+    title_h = 58
+    row_title_h = 28
+    method_label_h = 24
+    note_h = 24
+    col_gap = 12
+
+    ncols = len(use_methods)
+    content_w = margin * 2 + ncols * patch_w + (ncols - 1) * col_gap
+    row_block_h = row_title_h + patch_h + method_label_h + note_h
+    canvas_h = title_h + len(valid_rows) * row_block_h + (len(valid_rows) - 1) * row_gap + margin
+    canvas = np.full((canvas_h, content_w, 3), 255, dtype=np.uint8)
+
+    cv2.putText(
+        canvas,
+        "Local XOR magnification with notes",
+        (margin, 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (20, 20, 20),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "FP: red (over-seg), FN: blue (missed GT); region auto-selected by union XOR.",
+        (margin, 54),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        (45, 45, 45),
+        1,
+        cv2.LINE_AA,
+    )
+
+    y = title_h
+    for ridx1, rec in valid_rows:
+        img_name = os.path.basename(str(rec.get("image_path", "")))
+        cv2.putText(
+            canvas,
+            f"S{ridx1} - {img_name}",
+            (margin, y + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (20, 20, 20),
+            2,
+            cv2.LINE_AA,
+        )
+
+        gt = rec["gt"]
+        method_masks: Dict[str, np.ndarray] = rec["method_masks"]
+        method_panels: Dict[str, np.ndarray] = rec["method_panels"]
+        box = _compute_focus_box_multi(
+            gt,
+            [method_masks[m] for m in use_methods if m in method_masks],
+            pad=int(zoom_pad),
+            min_size=int(zoom_min_size),
+        )
+
+        for j, m in enumerate(use_methods):
+            panel = method_panels[m]
+            z = _crop_zoom(panel, box, float(zoom_scale))
+            z = cv2.resize(z, (patch_w, patch_h), interpolation=cv2.INTER_AREA)
+            x = margin + j * (patch_w + col_gap)
+            py = y + row_title_h
+            canvas[py : py + patch_h, x : x + patch_w] = z
+            cv2.rectangle(canvas, (x, py), (x + patch_w - 1, py + patch_h - 1), ZOOM_BOX_COLOR, 2)
+            cv2.putText(
+                canvas,
+                m,
+                (x + 4, py + patch_h + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (25, 25, 25),
+                1,
+                cv2.LINE_AA,
+            )
+
+        cv2.putText(
+            canvas,
+            "Auto ROI from XOR union of selected methods.",
+            (margin, y + row_title_h + patch_h + method_label_h + 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (45, 45, 45),
+            1,
+            cv2.LINE_AA,
+        )
+        y += row_block_h + row_gap
+
+    out_path = os.path.join(out_dir, "xor_zoom_local_notes.png")
+    cv2.imwrite(out_path, canvas)
+    return out_path
 
 
 def main() -> None:
@@ -292,6 +476,7 @@ def main() -> None:
 
     rows_img: List[np.ndarray] = []
     stats: List[dict] = []
+    row_records: List[dict] = []
 
     for i, d in enumerate(picks):
         img_path = str(d.get("file_name", ""))
@@ -381,6 +566,16 @@ def main() -> None:
                 }
             )
 
+        row_records.append(
+            {
+                "image_path": img_path,
+                "gt": gt.copy(),
+                "method_masks": {n: m.copy() for n, m in method_masks},
+                # 跳过 Raw/GT 两列，记录每个方法对应的 XOR panel
+                "method_panels": {method_name: cells[2 + idx].copy() for idx, (method_name, _) in enumerate(method_masks)},
+            }
+        )
+
         cells = [base_vis._resize_to_width(c, int(args.cell_width)) for c in cells]
         row = base_vis._stack_row(cells)
         rows_img.append(row)
@@ -403,6 +598,24 @@ def main() -> None:
         for r in stats:
             w.writerow({k: r.get(k, "") for k in fieldnames})
     print(f"saved: {out_csv}")
+
+    if bool(getattr(args, "enable_local_zoom_notes", False)):
+        out_local = _render_local_zoom_notes(
+            out_dir=out_dir,
+            row_records=row_records,
+            rows_csv=str(getattr(args, "local_zoom_rows", "1,3,4")),
+            methods_csv=str(getattr(args, "local_zoom_methods", "Mask R-CNN,Mask2Former,QSP-M2F")),
+            patch_w=int(getattr(args, "local_zoom_patch_w", 280)),
+            patch_h=int(getattr(args, "local_zoom_patch_h", 220)),
+            row_gap=int(getattr(args, "local_zoom_row_gap", 26)),
+            zoom_scale=float(getattr(args, "zoom_scale", 2.5)),
+            zoom_pad=int(getattr(args, "zoom_pad", 20)),
+            zoom_min_size=int(getattr(args, "zoom_min_size", 96)),
+        )
+        if out_local:
+            print(f"saved: {out_local}")
+        else:
+            print("skip local zoom notes: no valid rows/methods")
 
 
 if __name__ == "__main__":

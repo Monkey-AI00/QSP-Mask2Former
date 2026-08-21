@@ -1,0 +1,10 @@
+_BASE_: "mask2former_R50_plug_qsp_aug.yaml"
+
+MODEL:
+  MASK_FORMER:
+    # Table-2 row: Prior-bank + STN Align + Gated Correction (Ours)
+    PRIOR_ON: True
+    PRIOR_USE_BANK: True
+    PRIOR_ENABLE_ALIGN: True
+    PRIOR_ENABLE_GATED_FUSION: True
+

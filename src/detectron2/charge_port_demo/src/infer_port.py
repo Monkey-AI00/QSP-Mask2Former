@@ -1,45 +1,82 @@
 from typing import Any
 
-from geometry import pixel_to_camera, sample_depth
+import numpy as np
+
+from geometry import invert_transform, make_transform, pixel_to_camera, project_camera, sample_depth, transform_point
 from semantic_graph import SemanticGraph
+from validation import validate_transform
 
 
-def infer_port_2d(perception_result: dict[str, Any], graph: SemanticGraph) -> dict[str, Any]:
-    true_port_2d = perception_result.get("true_port_2d")
-    if true_port_2d is not None:
+def _heatmap_peaks(perception_result: dict[str, Any]) -> dict[str, float]:
+    heatmaps = perception_result.get("heatmaps", {})
+    if heatmaps:
+        return {name: float(np.max(np.asarray(heatmap, dtype=float))) for name, heatmap in heatmaps.items()}
+    return {name: float(score) for name, score in perception_result.get("keypoint_scores", {}).items()}
+
+
+def infer_port_pose(
+    perception_result: dict[str, Any],
+    sample: dict[str, Any],
+    graph: SemanticGraph,
+) -> dict[str, Any]:
+    camera = sample.get("camera", {})
+    intrinsics = camera.get("intrinsics")
+    if intrinsics is None:
+        raise ValueError("sample camera is missing intrinsics")
+    camera_to_robot = validate_transform(camera.get("camera_to_robot", np.eye(4)), "camera_to_robot")
+    peaks = _heatmap_peaks(perception_result)
+    candidates = []
+
+    for part_name, xy in perception_result.get("keypoints_2d", {}).items():
+        if part_name not in graph.relations:
+            continue
+        weight = float(peaks.get(part_name, 0.0))
+        if weight <= 0.0:
+            continue
+        depth = sample_depth(sample["depth"], float(xy[0]), float(xy[1]))
+        part_camera = pixel_to_camera(float(xy[0]), float(xy[1]), depth, intrinsics)
+        part_robot = transform_point(camera_to_robot, part_camera)
+        part_pose_robot = make_transform(np.eye(3), part_robot)
+        port_pose_robot = part_pose_robot @ graph.get_part_to_port_transform(part_name)
+        candidates.append(
+            {
+                "part_name": part_name,
+                "weight": weight,
+                "part_3d_camera": list(map(float, part_camera)),
+                "part_3d_robot": part_robot.tolist(),
+                "part_to_port_transform": graph.get_part_to_port_transform(part_name).tolist(),
+                "port_candidate_3d_robot": port_pose_robot[:3, 3].tolist(),
+            }
+        )
+
+    if not candidates:
         return {
-            "port_2d": [float(true_port_2d[0]), float(true_port_2d[1])],
-            "num_support_nodes": 1,
-            "support_nodes": ["true_port_2d"],
-            "method": "direct_annotation",
+            "port_2d": None,
+            "port_3d": None,
+            "port_pose_robot": None,
+            "num_support_nodes": 0,
+            "support_nodes": [],
+            "method": "graph_rigid_transform_fusion",
+            "coordinate_frame": "robot_base",
+            "candidates": [],
         }
 
-    keypoints = perception_result["keypoints_2d"]
-    scores = perception_result["keypoint_scores"]
-    weighted_x = 0.0
-    weighted_y = 0.0
-    total_w = 0.0
-    support_nodes: list[str] = []
-
-    for node_name, xy in keypoints.items():
-        relation = graph.get_port_relation(node_name)
-        if "to_charge_port_2d" not in relation:
-            continue
-        dx, dy = relation["to_charge_port_2d"]
-        weight = float(scores.get(node_name, 0.0))
-        weighted_x += (float(xy[0]) + float(dx)) * weight
-        weighted_y += (float(xy[1]) + float(dy)) * weight
-        total_w += weight
-        support_nodes.append(node_name)
-
-    if total_w <= 0.0:
-        return {"port_2d": None, "num_support_nodes": 0, "support_nodes": []}
-
+    weights = np.asarray([candidate["weight"] for candidate in candidates], dtype=float)
+    weights /= weights.sum()
+    positions = np.asarray([candidate["port_candidate_3d_robot"] for candidate in candidates], dtype=float)
+    port_robot = np.sum(positions * weights[:, None], axis=0)
+    port_pose_robot = make_transform(np.eye(3), port_robot)
+    port_camera = transform_point(invert_transform(camera_to_robot), port_robot)
+    pixel = project_camera(port_camera, intrinsics)
     return {
-        "port_2d": [weighted_x / total_w, weighted_y / total_w],
-        "num_support_nodes": len(support_nodes),
-        "support_nodes": support_nodes,
-        "method": "graph_weighted_average",
+        "port_2d": list(pixel) if pixel is not None else None,
+        "port_3d": port_robot.tolist(),
+        "port_pose_robot": port_pose_robot.tolist(),
+        "num_support_nodes": len(candidates),
+        "support_nodes": [candidate["part_name"] for candidate in candidates],
+        "method": "graph_rigid_transform_fusion",
+        "coordinate_frame": "robot_base",
+        "candidates": candidates,
     }
 
 
@@ -47,44 +84,20 @@ def infer_port_3d(
     perception_result: dict[str, Any],
     sample: dict[str, Any],
     graph: SemanticGraph,
-    intrinsics: dict[str, Any],
+    intrinsics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    result_2d = infer_port_2d(perception_result, graph)
-    if result_2d.get("port_2d") is not None and result_2d.get("method") == "direct_annotation":
-        u, v = result_2d["port_2d"]
-        depth = sample_depth(sample["depth"], u, v)
-        result_2d["port_3d"] = pixel_to_camera(u, v, depth, intrinsics)
-        return result_2d
-
-    keypoints = perception_result["keypoints_2d"]
-    scores = perception_result["keypoint_scores"]
-    depth_map = sample["depth"]
-    weighted = [0.0, 0.0, 0.0]
-    total_w = 0.0
-
-    for node_name, xy in keypoints.items():
-        relation = graph.get_port_relation(node_name)
-        if "to_charge_port_3d" not in relation:
-            continue
-        depth = sample_depth(depth_map, xy[0], xy[1])
-        point_cam = pixel_to_camera(xy[0], xy[1], depth, intrinsics)
-        delta = relation["to_charge_port_3d"]
-        candidate = [point_cam[0] + delta[0], point_cam[1] + delta[1], point_cam[2] + delta[2]]
-        weight = float(scores.get(node_name, 0.0))
-        weighted[0] += candidate[0] * weight
-        weighted[1] += candidate[1] * weight
-        weighted[2] += candidate[2] * weight
-        total_w += weight
-
-    port_3d = None
-    if total_w > 0.0:
-        port_3d = [weighted[0] / total_w, weighted[1] / total_w, weighted[2] / total_w]
-
-    result_2d["port_3d"] = port_3d
-    return result_2d
+    if intrinsics is not None:
+        sample = dict(sample)
+        camera = dict(sample.get("camera", {}))
+        camera.setdefault("intrinsics", intrinsics)
+        sample["camera"] = camera
+    return infer_port_pose(perception_result, sample, graph)
 
 
 def fuse_port_estimates(port_candidates: list[dict[str, Any]]) -> dict[str, Any]:
     if not port_candidates:
         return {"port_2d": None, "port_3d": None, "num_support_nodes": 0, "support_nodes": []}
-    return port_candidates[0]
+    weights = np.asarray([float(item.get("weight", 1.0)) for item in port_candidates], dtype=float)
+    weights /= weights.sum()
+    positions = np.asarray([item["port_3d"] for item in port_candidates], dtype=float)
+    return {"port_3d": np.sum(positions * weights[:, None], axis=0).tolist(), "num_support_nodes": len(port_candidates)}

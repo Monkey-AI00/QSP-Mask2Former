@@ -110,6 +110,10 @@ class SpatialPriorTransformer(nn.Module):
         """
         B = pred_angle.shape[0]
         H, W = int(out_hw[0]), int(out_hw[1])
+        if B == 0:
+            # 某些评测图片可能没有任何有效 ROI，affine_grid 不支持 batch=0。
+            # 这里直接返回空 prior batch，保持下游张量维度一致。
+            return self.mean_shape.new_zeros((0, 1, H, W))
 
         cos_theta = torch.cos(pred_angle)
         sin_theta = torch.sin(pred_angle)
@@ -188,6 +192,19 @@ class ShapePriorAdapter(nn.Module):
             return_debug=True：ShapePriorAdapterOutput
         """
         B, C, H, W = x_features.shape
+        if B == 0:
+            # 无 ROI 时直接透传，避免进入 STN 的 affine_grid(batch=0) 报错。
+            pred_angle = x_features.new_zeros((0, 1))
+            rotated_prior = x_features.new_zeros((0, 1, H, W))
+            if return_debug:
+                gate = x_features.new_zeros((0, 1, H, W))
+                return ShapePriorAdapterOutput(
+                    x_out=x_features,
+                    pred_angle=pred_angle,
+                    rotated_prior=rotated_prior,
+                    gate_map=gate,
+                )
+            return x_features, pred_angle
         if H != self.prior_size or W != self.prior_size:
             # 这里严格一些：ROI 特征尺寸应与 prior_size 一致，否则 AnglePredictor 的 flatten 维度会不匹配
             raise ValueError(

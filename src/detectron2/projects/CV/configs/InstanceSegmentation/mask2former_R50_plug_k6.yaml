@@ -1,0 +1,14 @@
+_BASE_: "mask2former_R50_plug_qsp_aug.yaml"
+
+MODEL:
+  MASK_FORMER:
+    # Table-3: K=6 prior bank
+    PRIOR_ON: True
+    PRIOR_PATH: "/home/users1/sjw/cursor/workspace/outputs/gangkou/plug_prior/plug_prior_bank6.npy"
+    PRIOR_USE_BANK: True
+    PRIOR_BANK_SIZE: 6
+    PRIOR_ENABLE_ALIGN: True
+    PRIOR_ENABLE_GATED_FUSION: True
+    PRIOR_ALPHA: 0.5
+    PRIOR_LOSS_WEIGHT: 0.5
+

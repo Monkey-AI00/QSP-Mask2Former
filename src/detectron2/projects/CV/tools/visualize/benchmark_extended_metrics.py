@@ -346,9 +346,119 @@ def _write_table1_markdown(
         f.write("\n".join(lines) + "\n")
 
 
+def _write_table2_ablation(
+    *,
+    rows: List[dict],
+    out_csv: str,
+    out_md: str,
+    target_severity: float = 1.0,
+) -> None:
+    """
+    导出表2（固定结构）：
+      Method | Shape-Prior | STN-Align | Gated-Fusion | HD95 | Boundary-IoU | Segm-AP
+    """
+    import csv
+
+    if not rows:
+        return
+
+    severities = sorted({float(r.get("severity", 0.0)) for r in rows})
+    if not severities:
+        return
+    sev_used = min(severities, key=lambda s: abs(float(s) - float(target_severity)))
+
+    by_method = {}
+    for r in rows:
+        if float(r.get("severity", 0.0)) == float(sev_used):
+            by_method[str(r.get("method", ""))] = r
+
+    row_specs = [
+        ("Base (Mask2Former)", ["Mask2Former"], False, False, False),
+        ("+Prior-bank", ["Abl+PriorBank"], True, False, False),
+        ("Prior-bank+STN Align", ["Abl+PriorBank+STN"], True, True, False),
+        (
+            "Prior-bank+STN Align+Gated Correction (Ours)",
+            ["Abl+PriorBank+STN+Gated", "Mask2Former+QSP"],
+            True,
+            True,
+            True,
+        ),
+    ]
+
+    out_rows = []
+    for disp, method_keys, has_prior, has_stn, has_gated in row_specs:
+        src_key = ""
+        src = None
+        for k in method_keys:
+            if k in by_method:
+                src_key = k
+                src = by_method[k]
+                break
+        out_rows.append(
+            {
+                "Method": disp,
+                "Shape-Prior": "√" if has_prior else "",
+                "STN-Align": "√" if has_stn else "",
+                "Gated-Fusion": "√" if has_gated else "",
+                "HD95": _fmt_hd(float(src.get("hd95", float("nan"))) if src else float("nan")),
+                "Boundary-IoU": _fmt_iou(float(src.get("boundary_iou", float("nan"))) if src else float("nan")),
+                "Segm-AP": _fmt_ap(float(src.get("segm_AP", float("nan"))) if src else float("nan")),
+                "severity_used": f"{float(sev_used):.2f}",
+                "source_method": src_key or "",
+            }
+        )
+
+    keys = [
+        "Method",
+        "Shape-Prior",
+        "STN-Align",
+        "Gated-Fusion",
+        "HD95",
+        "Boundary-IoU",
+        "Segm-AP",
+        "severity_used",
+        "source_method",
+    ]
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in out_rows:
+            w.writerow({k: r.get(k, "") for k in keys})
+
+    md = []
+    md.append(f"Table-2 Ablation (severity={float(sev_used):.2f})")
+    md.append("")
+    md.append(
+        "| Method | Shape-Prior | STN-Align | Gated-Fusion | HD95 ↓ | Boundary-IoU ↑ | Segm-AP ↑ |"
+    )
+    md.append("|---|---|---|---|---:|---:|---:|")
+    for r in out_rows:
+        md.append(
+            "| "
+            + " | ".join(
+                [
+                    str(r["Method"]),
+                    str(r["Shape-Prior"]),
+                    str(r["STN-Align"]),
+                    str(r["Gated-Fusion"]),
+                    str(r["HD95"]),
+                    str(r["Boundary-IoU"]),
+                    str(r["Segm-AP"]),
+                ]
+            )
+            + " |"
+        )
+    with open(out_md, "w", encoding="utf-8") as f:
+        f.write("\n".join(md) + "\n")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extended benchmark metrics + curves.")
-    p.add_argument("--config-file", required=True)
+    p.add_argument(
+        "--config-file",
+        default="",
+        help="PointRend 的 config yaml（仅在启用 --weights-base/--weights-prior 时需要）。",
+    )
     p.add_argument(
         "--config-file-maskrcnn",
         default="",
@@ -370,6 +480,21 @@ def parse_args() -> argparse.Namespace:
         help="Mask2Former+QSP 的 config yaml（可选；未提供时回退到 --config-file-mask2former）。",
     )
     p.add_argument(
+        "--config-file-mask2former-priorbank",
+        default="",
+        help="Ablation: +Prior-bank 的 config yaml（可选；未提供时回退到 qsp/base config）。",
+    )
+    p.add_argument(
+        "--config-file-mask2former-priorbank-stn",
+        default="",
+        help="Ablation: Prior-bank+STN Align 的 config yaml（可选；未提供时回退到 qsp/base config）。",
+    )
+    p.add_argument(
+        "--config-file-mask2former-ours",
+        default="",
+        help="Ablation: Ours 的 config yaml（可选；未提供时回退到 qsp/base config）。",
+    )
+    p.add_argument(
         "--transfiner-root",
         default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "transfiner")),
         help="Mask Transfiner 项目根目录（用于子进程评测，避免 detectron2 包冲突）。",
@@ -383,8 +508,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--json-file", default="plug_train.json")
     p.add_argument("--out-root", required=True, help="输出根目录：缓存评测集 + plots + tables")
 
-    p.add_argument("--weights-base", required=True)
-    p.add_argument("--weights-prior", required=True)
+    p.add_argument("--weights-base", default="", help="PointRend Base 权重（可选）")
+    p.add_argument("--weights-prior", default="", help="PointRend PRIOR 权重（可选）")
     p.add_argument("--weights-maskrcnn", default="", help="Mask R-CNN 训练好的权重路径（model_final.pth）")
     p.add_argument("--weights-mask2former", default="", help="Mask2Former 训练好的权重路径（model_final.pth/.pkl）")
     p.add_argument(
@@ -401,6 +526,21 @@ def parse_args() -> argparse.Namespace:
         "--weights-mask2former-qsp",
         default="",
         help="Mask2Former(+QSP) 训练好的权重路径（可选；用于表1 Geometry-aware: M2F + QSP）。",
+    )
+    p.add_argument(
+        "--weights-mask2former-priorbank",
+        default="",
+        help="Ablation: +Prior-bank 权重（用于表2）。",
+    )
+    p.add_argument(
+        "--weights-mask2former-priorbank-stn",
+        default="",
+        help="Ablation: Prior-bank+STN Align 权重（用于表2）。",
+    )
+    p.add_argument(
+        "--weights-mask2former-ours",
+        default="",
+        help="Ablation: Ours 权重（用于表2；未提供时可回退到 --weights-mask2former-qsp）。",
     )
     p.add_argument("--weights-transfiner", default="", help="Mask Transfiner 训练好的权重路径（model_final.pth）")
     p.add_argument("--shape-prior-npy", default="", help="PointRend 的 ShapePrior(.npy) 路径，仅供 --weights-prior 使用。")
@@ -420,7 +560,25 @@ def parse_args() -> argparse.Namespace:
     # 回滚到“最初版本”评测集生成：不做 focus/clip/dilate/feather，仅使用全图随机高斯强光
 
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--overwrite-cache", action="store_true")
+    p.add_argument(
+        "--overwrite-cache",
+        dest="overwrite_cache",
+        action="store_true",
+        help="覆盖并重建 datasets_cache（默认开启）。",
+    )
+    p.add_argument(
+        "--no-overwrite-cache",
+        dest="overwrite_cache",
+        action="store_false",
+        help="不覆盖缓存，若缓存存在则复用。",
+    )
+    p.set_defaults(overwrite_cache=True)
+    p.add_argument(
+        "--table2-severity",
+        type=float,
+        default=1.0,
+        help="表2导出使用的 severity（默认 1.0；若不存在则自动取最近值）。",
+    )
 
     # -------------------------------
     # speed benchmark (optional)
@@ -452,6 +610,11 @@ def parse_args() -> argparse.Namespace:
         "--speed-cuda-sync",
         action="store_true",
         help="速度计时前后调用 torch.cuda.synchronize()（CUDA 下更准确，但略慢）。",
+    )
+    p.add_argument(
+        "--speed-all-severities",
+        action="store_true",
+        help="对 --severities 中的每个 severity 分别评估推理速度。",
     )
     p.add_argument(
         "--export-severity-s1",
@@ -918,6 +1081,7 @@ def _eval_speed(
     num_images: int,
     warmup: int,
     cuda_sync: bool,
+    predictor=None,
 ) -> Dict[str, float]:
     """
     评测推理速度（FPS / ms-per-img），尽量减少 I/O 干扰：
@@ -939,9 +1103,10 @@ def _eval_speed(
     if not imgs:
         return {"fps": float("nan"), "ms_per_img": float("nan"), "speed_num_images": 0}
 
-    from detectron2.engine import DefaultPredictor
+    if predictor is None:
+        from detectron2.engine import DefaultPredictor
 
-    predictor = DefaultPredictor(cfg)
+        predictor = DefaultPredictor(cfg)
 
     # optional CUDA sync for accurate timing
     sync = None
@@ -1097,11 +1262,25 @@ def main() -> None:
 
     rows: List[dict] = []
 
-    # 两个方法
-    methods: List[dict] = [
-        {"method": "BASE", "kind": "pointrend", "weights": os.path.abspath(args.weights_base), "head": "PointRendMaskHead"},
-        {"method": "PRIOR", "kind": "pointrend", "weights": os.path.abspath(args.weights_prior), "head": "ShapeAwareCoarseMaskHead"},
-    ]
+    methods: List[dict] = []
+    if str(getattr(args, "weights_base", "")).strip():
+        methods.append(
+            {
+                "method": "BASE",
+                "kind": "pointrend",
+                "weights": os.path.abspath(str(args.weights_base).strip()),
+                "head": "PointRendMaskHead",
+            }
+        )
+    if str(getattr(args, "weights_prior", "")).strip():
+        methods.append(
+            {
+                "method": "PRIOR",
+                "kind": "pointrend",
+                "weights": os.path.abspath(str(args.weights_prior).strip()),
+                "head": "ShapeAwareCoarseMaskHead",
+            }
+        )
     if str(getattr(args, "weights_maskrcnn", "")).strip():
         if not str(getattr(args, "config_file_maskrcnn", "")).strip():
             raise ValueError("提供 --weights-maskrcnn 时必须同时提供 --config-file-maskrcnn")
@@ -1154,6 +1333,58 @@ def main() -> None:
                 else "",
             }
         )
+    if str(getattr(args, "weights_mask2former_priorbank", "")).strip():
+        cfg_priorbank = str(getattr(args, "config_file_mask2former_priorbank", "")).strip() or str(
+            getattr(args, "config_file_mask2former_qsp", "")
+        ).strip() or str(getattr(args, "config_file_mask2former", "")).strip()
+        if not cfg_priorbank:
+            raise ValueError("提供 --weights-mask2former-priorbank 时必须提供对应 config")
+        methods.append(
+            {
+                "method": "Abl+PriorBank",
+                "kind": "mask2former",
+                "weights": os.path.abspath(str(args.weights_mask2former_priorbank).strip()),
+                "config": os.path.abspath(cfg_priorbank),
+                "prior_path": os.path.abspath(str(args.prior_path_mask2former_qsp).strip())
+                if str(getattr(args, "prior_path_mask2former_qsp", "")).strip()
+                else "",
+            }
+        )
+    if str(getattr(args, "weights_mask2former_priorbank_stn", "")).strip():
+        cfg_priorbank_stn = str(getattr(args, "config_file_mask2former_priorbank_stn", "")).strip() or str(
+            getattr(args, "config_file_mask2former_qsp", "")
+        ).strip() or str(getattr(args, "config_file_mask2former", "")).strip()
+        if not cfg_priorbank_stn:
+            raise ValueError("提供 --weights-mask2former-priorbank-stn 时必须提供对应 config")
+        methods.append(
+            {
+                "method": "Abl+PriorBank+STN",
+                "kind": "mask2former",
+                "weights": os.path.abspath(str(args.weights_mask2former_priorbank_stn).strip()),
+                "config": os.path.abspath(cfg_priorbank_stn),
+                "prior_path": os.path.abspath(str(args.prior_path_mask2former_qsp).strip())
+                if str(getattr(args, "prior_path_mask2former_qsp", "")).strip()
+                else "",
+            }
+        )
+    ours_w = str(getattr(args, "weights_mask2former_ours", "")).strip()
+    if ours_w:
+        cfg_ours = str(getattr(args, "config_file_mask2former_ours", "")).strip() or str(
+            getattr(args, "config_file_mask2former_qsp", "")
+        ).strip() or str(getattr(args, "config_file_mask2former", "")).strip()
+        if not cfg_ours:
+            raise ValueError("提供 --weights-mask2former-ours 时必须提供对应 config")
+        methods.append(
+            {
+                "method": "Abl+PriorBank+STN+Gated",
+                "kind": "mask2former",
+                "weights": os.path.abspath(ours_w),
+                "config": os.path.abspath(cfg_ours),
+                "prior_path": os.path.abspath(str(args.prior_path_mask2former_qsp).strip())
+                if str(getattr(args, "prior_path_mask2former_qsp", "")).strip()
+                else "",
+            }
+        )
     if str(getattr(args, "weights_mask2former_geoloss", "")).strip():
         if not str(getattr(args, "config_file_mask2former", "")).strip():
             raise ValueError("提供 --weights-mask2former-geoloss 时必须同时提供 --config-file-mask2former")
@@ -1177,6 +1408,13 @@ def main() -> None:
                 "root": os.path.abspath(str(args.transfiner_root).strip()),
             }
         )
+    if not methods:
+        raise ValueError("未提供任何可评测权重，请至少提供一组 --weights-* 参数。")
+
+    # 仅当评测 PointRend 分支时，才要求 --config-file
+    if any(str(m.get("kind", "")) == "pointrend" for m in methods):
+        if not str(getattr(args, "config_file", "")).strip():
+            raise ValueError("启用 PointRend（--weights-base/--weights-prior）时必须提供 --config-file。")
 
     for severity, ds_root in sorted(dataset_roots.items(), key=lambda x: x[0]):
         # 注册 dataset
@@ -1262,12 +1500,23 @@ def main() -> None:
     if bool(getattr(args, "eval_speed", False)):
         import csv
 
-        # choose dataset at requested severity (fallback to closest in args.severities)
-        s0 = float(max(0.0, min(1.0, float(getattr(args, "speed_severity", 0.0)))))
-        if s0 not in dataset_roots:
-            ss = sorted(dataset_roots.keys())
-            s0 = min(ss, key=lambda x: abs(float(x) - s0)) if ss else 0.0
-        speed_dataset_name = f"plug_bench_s{s0:.2f}".replace(".", "p")
+        # By default the multi-severity benchmark evaluates every requested
+        # severity. The single-severity mode remains available through
+        # --speed-severity when --speed-all-severities is not set.
+        if bool(getattr(args, "speed_all_severities", False)):
+            requested_speed_severities = [float(s) for s in args.severities]
+        else:
+            requested_speed_severities = [float(getattr(args, "speed_severity", 0.0))]
+        if not requested_speed_severities:
+            requested_speed_severities = [0.0]
+
+        available_severities = sorted(float(s) for s in dataset_roots.keys())
+        speed_targets = []
+        for requested_s in requested_speed_severities:
+            s0 = float(max(0.0, min(1.0, requested_s)))
+            if s0 not in dataset_roots:
+                s0 = min(available_severities, key=lambda x: abs(float(x) - s0)) if available_severities else 0.0
+            speed_targets.append((s0, f"plug_bench_s{s0:.2f}".replace(".", "p")))
 
         speed_rows: List[dict] = []
         for m in methods:
@@ -1275,13 +1524,33 @@ def main() -> None:
             kind = str(m["kind"])
             weights = str(m["weights"])
 
+            if kind == "transfiner":
+                # transfiner 与主工程 detectron2 存在包冲突，精确速度评测需要在 transfiner 子进程内完成。
+                # 这里对每个 severity 写入 NaN，避免影响主流程产出 metrics 表格。
+                for s0, _speed_dataset_name in speed_targets:
+                    speed_row = {
+                        "method": method,
+                        "severity": float(s0),
+                        "device": "n/a",
+                        "fps": float("nan"),
+                        "ms_per_img": float("nan"),
+                        "speed_num_images": 0,
+                    }
+                    speed_rows.append(speed_row)
+                    print(f"[SPEED] {method} severity={s0:.2f} skipped (cross-repo detectron2 conflict)")
+                continue
+
+            # Build/load each model once, then reuse it across all severity
+            # datasets. Model construction is intentionally excluded from the
+            # measured inference time.
+            first_speed_dataset_name = speed_targets[0][1]
             if kind == "maskrcnn":
                 cfg = _build_cfg_maskrcnn(
                     config_file=str(m["config"]),
                     weights=weights,
                     num_classes=num_classes,
                     score_thr=args.score_thr,
-                    dataset_test_name=speed_dataset_name,
+                    dataset_test_name=first_speed_dataset_name,
                 )
             elif kind == "mask2former":
                 cfg = _build_cfg_mask2former(
@@ -1290,23 +1559,9 @@ def main() -> None:
                     weights=weights,
                     num_classes=num_classes,
                     score_thr=args.score_thr,
-                    dataset_test_name=speed_dataset_name,
+                    dataset_test_name=first_speed_dataset_name,
                     prior_path_override=str(m.get("prior_path", "")),
                 )
-            elif kind == "transfiner":
-                # transfiner 与主工程 detectron2 存在包冲突，精确速度评测需要在 transfiner 子进程内完成。
-                # 这里先写 NaN，避免影响主流程产出 metrics 表格。
-                speed_row = {
-                    "method": method,
-                    "severity": float(s0),
-                    "device": "n/a",
-                    "fps": float("nan"),
-                    "ms_per_img": float("nan"),
-                    "speed_num_images": 0,
-                }
-                speed_rows.append(speed_row)
-                print(f"[SPEED] {method} severity={s0:.2f} skipped (cross-repo detectron2 conflict)")
-                continue
             else:
                 cfg = _build_cfg(
                     config_file=os.path.abspath(args.config_file),
@@ -1314,28 +1569,33 @@ def main() -> None:
                     mask_head_name=str(m["head"]),
                     num_classes=num_classes,
                     score_thr=args.score_thr,
-                    dataset_test_name=speed_dataset_name,
+                    dataset_test_name=first_speed_dataset_name,
                 )
 
-            sp = _eval_speed(
-                cfg=cfg,
-                dataset_name=speed_dataset_name,
-                num_images=int(getattr(args, "speed_num_images", 200)),
-                warmup=int(getattr(args, "speed_warmup", 20)),
-                cuda_sync=bool(getattr(args, "speed_cuda_sync", False)),
-            )
-            speed_row = {
-                "method": method,
-                "severity": float(s0),
-                "device": str(getattr(cfg.MODEL, "DEVICE", "")),
-                **sp,
-            }
-            speed_rows.append(speed_row)
-            print(
-                f"[SPEED] {method} severity={s0:.2f} "
-                f"fps={speed_row.get('fps')} ms_per_img={speed_row.get('ms_per_img')} "
-                f"num_images={speed_row.get('speed_num_images')} device={speed_row.get('device')}"
-            )
+            from detectron2.engine import DefaultPredictor
+
+            predictor = DefaultPredictor(cfg)
+            for s0, speed_dataset_name in speed_targets:
+                sp = _eval_speed(
+                    cfg=cfg,
+                    dataset_name=speed_dataset_name,
+                    num_images=int(getattr(args, "speed_num_images", 200)),
+                    warmup=int(getattr(args, "speed_warmup", 20)),
+                    cuda_sync=bool(getattr(args, "speed_cuda_sync", False)),
+                    predictor=predictor,
+                )
+                speed_row = {
+                    "method": method,
+                    "severity": float(s0),
+                    "device": str(getattr(cfg.MODEL, "DEVICE", "")),
+                    **sp,
+                }
+                speed_rows.append(speed_row)
+                print(
+                    f"[SPEED] {method} severity={s0:.2f} "
+                    f"fps={speed_row.get('fps')} ms_per_img={speed_row.get('ms_per_img')} "
+                    f"num_images={speed_row.get('speed_num_images')} device={speed_row.get('device')}"
+                )
 
         # write speed table
         with open(os.path.join(tables_dir, "speed_fps.json"), "w") as f:
@@ -1360,6 +1620,19 @@ def main() -> None:
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in keys})
+
+    # 表2：模块消融（固定结构，默认 severity=1.00）
+    try:
+        _write_table2_ablation(
+            rows=rows,
+            out_csv=os.path.join(tables_dir, "table2_ablation.csv"),
+            out_md=os.path.join(tables_dir, "table2_ablation.md"),
+            target_severity=float(getattr(args, "table2_severity", 1.0)),
+        )
+        print(f"[TABLE2] written: {os.path.join(tables_dir, 'table2_ablation.csv')}")
+        print(f"[TABLE2] written: {os.path.join(tables_dir, 'table2_ablation.md')}")
+    except Exception as e:
+        print(f"[TABLE2] skipped due to error: {e}")
 
     # 论文表 1：按截图格式输出（LaTeX + Markdown 预览版）
     try:

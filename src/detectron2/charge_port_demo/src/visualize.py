@@ -106,25 +106,31 @@ def draw_action_panel(image: np.ndarray, action: dict[str, Any], title: str = "a
     return _to_np(pil)
 
 
-def save_frame(image: np.ndarray, frame_id: str) -> Path:
-    FRAME_DIR.mkdir(parents=True, exist_ok=True)
-    path = FRAME_DIR / f"{frame_id}.png"
+def save_frame(image: np.ndarray, frame_id: str, frame_dir: Path | None = None) -> Path:
+    destination = frame_dir or FRAME_DIR
+    destination.mkdir(parents=True, exist_ok=True)
+    path = destination / f"{frame_id}.png"
     _to_pil(image).save(path)
     return path
 
 
-def build_video_from_frames(frame_dir: Path, output_path: Path) -> None:
+def build_video_from_frames(frame_dir: Path, output_path: Path) -> Path | None:
     frame_paths = sorted(frame_dir.glob("*.png"))
     if not frame_paths:
-        return
+        return None
     try:
         import cv2  # type: ignore
     except Exception:
-        return
+        images = [_to_pil(np.array(Image.open(path).convert("RGB"))) for path in frame_paths]
+        gif_path = output_path.with_suffix(".gif")
+        gif_path.parent.mkdir(parents=True, exist_ok=True)
+        duration_ms = max(100, int(round(1000.0 * float(VIDEO_HOLD_SECONDS))))
+        images[0].save(gif_path, save_all=True, append_images=images[1:], duration=duration_ms, loop=0)
+        return gif_path
 
     first = cv2.imread(str(frame_paths[0]))
     if first is None:
-        return
+        return None
     height, width = first.shape[:2]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fps = float(VIDEO_FPS)
@@ -136,3 +142,4 @@ def build_video_from_frames(frame_dir: Path, output_path: Path) -> None:
             for _ in range(repeat_count):
                 writer.write(frame)
     writer.release()
+    return output_path

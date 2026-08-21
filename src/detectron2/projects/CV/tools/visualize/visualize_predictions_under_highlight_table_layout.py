@@ -132,6 +132,20 @@ def parse_args() -> argparse.Namespace:
     # visualization
     p.add_argument("--cell-width", type=int, default=520, help="每个格子的宽度（像素），高度按比例缩放")
     p.add_argument(
+        "--no-header",
+        "--hide-header",
+        dest="no_header",
+        action="store_true",
+        help="去掉图片上方的全局列图注；默认保留图注。",
+    )
+    p.add_argument(
+        "--no-row-tags",
+        "--hide-row-tags",
+        dest="no_row_tags",
+        action="store_true",
+        help="去掉每行左上角的 S1/S2/... 标签；默认保留标签。",
+    )
+    p.add_argument(
         "--pred-erode",
         type=int,
         default=0,
@@ -225,6 +239,30 @@ def _stack_grid(rows: List[np.ndarray]) -> np.ndarray:
             pad = w - r.shape[1]
             outs.append(cv2.copyMakeBorder(r, 0, 0, 0, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0)))
     return np.concatenate(outs, axis=0)
+
+
+def _make_header_row(column_titles: List[str], cell_width: int, header_h: int = 54) -> np.ndarray:
+    w = int(cell_width) * len(column_titles)
+    h = int(header_h)
+    header = np.full((h, w, 3), 245, dtype=np.uint8)
+    cv2.line(header, (0, h - 1), (w - 1, h - 1), (165, 165, 165), 2, cv2.LINE_AA)
+    for i, title in enumerate(column_titles):
+        x0 = i * int(cell_width)
+        cv2.line(header, (x0, 0), (x0, h - 1), (220, 220, 220), 1, cv2.LINE_AA)
+        (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.72, 2)
+        tx = x0 + max(6, (int(cell_width) - tw) // 2)
+        ty = max(th + 6, (h + th) // 2 - 4)
+        cv2.putText(header, title, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (35, 35, 35), 2, cv2.LINE_AA)
+    cv2.line(header, (w - 1, 0), (w - 1, h - 1), (220, 220, 220), 1, cv2.LINE_AA)
+    return header
+
+
+def _add_row_tag(row_img: np.ndarray, tag: str) -> np.ndarray:
+    out = row_img.copy()
+    cv2.rectangle(out, (6, 6), (44, 28), (248, 248, 248), thickness=-1)
+    cv2.rectangle(out, (6, 6), (44, 28), (178, 178, 178), thickness=1)
+    cv2.putText(out, tag, (13, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (40, 40, 40), 1, cv2.LINE_AA)
+    return out
 
 
 def _overlay_mask(
@@ -752,6 +790,7 @@ def main() -> None:
         )
 
     rows_img: List[np.ndarray] = []
+    column_titles: List[str] = []
     error_rows: List[dict] = []
     for i, d in enumerate(picks):
         img_path = d["file_name"]
@@ -817,8 +856,8 @@ def main() -> None:
         tf_mask_vis = _erode_mask(tf_mask, ep) if (tf_mask is not None) else None
 
         # visual cells
-        input_vis = _title_bar(input_bgr, "Input (highlight)")
-        gt_vis = _title_bar(_overlay_mask(input_bgr, gt, color_bgr=(0, 255, 0), alpha=0.35, outline=True), "GroundTruth")
+        input_vis = input_bgr.copy()
+        gt_vis = _overlay_mask(input_bgr, gt, color_bgr=(0, 255, 0), alpha=0.35, outline=True)
 
         method_masks: List[Tuple[str, np.ndarray, np.ndarray, Tuple[int, int, int]]] = [
             ("Mask R-CNN", maskrcnn_mask, maskrcnn_mask_vis, (120, 200, 255)),
@@ -836,13 +875,13 @@ def main() -> None:
             method_masks.insert(1, ("MaskTransfiner", tf_mask, tf_mask_vis, (200, 120, 255)))
 
         cells: List[np.ndarray] = [input_vis, gt_vis]
+        local_titles: List[str] = ["Raw", "GT"]
         for method_name, raw_mask, vis_mask, color_bgr in method_masks:
             pred_vis = _overlay_mask(input_bgr, vis_mask, color_bgr=color_bgr, alpha=0.35, outline=True)
             if str(args.mode) == "pred_only":
-                pred_vis = _title_bar(pred_vis, method_name)
                 cells.append(pred_vis)
+                local_titles.append(method_name)
             else:
-                pred_vis = _title_bar(pred_vis, f"{method_name} Pred")
                 xor_img, fp_px, fn_px = _xor_vis(
                     input_bgr,
                     gt,
@@ -852,8 +891,9 @@ def main() -> None:
                     alpha=float(args.xor_alpha),
                     bg_dim=float(args.xor_bg_dim),
                 )
-                xor_vis = _title_bar(xor_img, f"{method_name} XOR")
+                xor_vis = xor_img
                 cells.extend([pred_vis, xor_vis])
+                local_titles.extend([f"{method_name} Pred", f"{method_name} XOR"])
                 error_rows.append(
                     {
                         "image_path": str(img_path),
@@ -866,15 +906,25 @@ def main() -> None:
                     }
                 )
 
+        if not column_titles:
+            column_titles = list(local_titles)
+
         cells = [_resize_to_width(c, int(args.cell_width)) for c in cells]
         row = _stack_row(cells)
+        if not bool(args.no_row_tags):
+            row = _add_row_tag(row, f"S{i + 1}")
         rows_img.append(row)
 
         # per-row also save
         stem = f"{i:02d}_" + os.path.splitext(os.path.basename(img_path))[0]
         cv2.imwrite(os.path.join(out_dir, f"{stem}_row.png"), row)
 
-    grid = _stack_grid(rows_img)
+    grid_body = _stack_grid(rows_img)
+    if bool(args.no_header):
+        grid = grid_body
+    else:
+        header = _make_header_row(column_titles, int(args.cell_width), header_h=54)
+        grid = np.concatenate([header, grid_body], axis=0)
     if str(args.mode) == "pred_only":
         out_path = os.path.join(out_dir, "table_layout_grid.png")
     else:
