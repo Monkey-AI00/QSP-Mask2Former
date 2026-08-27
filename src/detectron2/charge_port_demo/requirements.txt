@@ -1,5 +1,0 @@
-numpy
-Pillow
-python-docx
-# Optional: MP4 export. Without it, Pillow writes an animated GIF.
-opencv-python
