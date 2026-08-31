@@ -1,0 +1,5 @@
+numpy>=1.20
+opencv-python>=4.5
+PyYAML>=5.4
+torch>=1.9
+torchvision>=0.10

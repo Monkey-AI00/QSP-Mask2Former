@@ -1,0 +1,12 @@
+_BASE_: "../qsp/mask2former_R50_plug_qsp_aug.yaml"
+
+MODEL:
+  MASK_FORMER:
+    PRIOR_ON: True
+    PRIOR_PATH: ""
+    PRIOR_USE_BANK: True
+    PRIOR_BANK_SIZE: 4
+    PRIOR_ENABLE_ALIGN: True
+    PRIOR_ENABLE_GATED_FUSION: True
+    PRIOR_ALPHA: 0.5
+    PRIOR_LOSS_WEIGHT: 0.5

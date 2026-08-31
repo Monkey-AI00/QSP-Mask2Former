@@ -1,0 +1,14 @@
+_BASE_: "../base/mask2former_R50_plug.yaml"
+
+MODEL:
+  MASK_FORMER:
+    PRIOR_ON: True
+    PRIOR_PATH: ""
+    PRIOR_ALPHA: 1.0
+    PRIOR_LOSS_WEIGHT: 1.0
+    PRIOR_ALIGN_TYPE: "similarity"
+    PRIOR_USE_BANK: False
+    PRIOR_BANK_SIZE: 1
+    PRIOR_DEBUG: False
+    SDF_WEIGHT: 0.0
+    GEOLOSS_WEIGHT: 0.0

@@ -1,0 +1,20 @@
+_BASE_: "${MASK2FORMER_ROOT}/configs/coco/instance-segmentation/maskformer2_R50_bs16_50ep.yaml"
+
+MODEL:
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 1
+
+SOLVER:
+  IMS_PER_BATCH: 1
+  BASE_LR: 0.0001
+  MAX_ITER: 3000
+  STEPS: (2100, 2700)
+
+INPUT:
+  IMAGE_SIZE: 800
+  MIN_SCALE: 0.1
+  MAX_SCALE: 2.0
+
+DATASETS:
+  TRAIN: ("plug_train1",)
+  TEST: ("plug_train1",)

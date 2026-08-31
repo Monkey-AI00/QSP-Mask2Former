@@ -1,0 +1,7 @@
+_BASE_: "../base/mask2former_R50_plug.yaml"
+
+MODEL:
+  MASK_FORMER:
+    GEOLOSS_WEIGHT: 1.0
+    GEOLOSS_BAND_DILATION_RATIO: 0.02
+    GEOLOSS_BAND_ALPHA: 2.0
