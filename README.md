@@ -44,7 +44,7 @@ python -m pip install -r requirements.txt
 
 The Plug dataset used in this project is available from Google Drive.
 
-- [Download the Plug Dataset](https://drive.google.com/uc?export=download&id=19NNCDXooxJ7B8T9f3zx7ATTTcE2NONFU)
+- [Download the plug_data](https://drive.google.com/uc?export=download&id=19NNCDXooxJ7B8T9f3zx7ATTTcE2NONFU)
 
 
 ## Training
