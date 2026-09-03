@@ -40,6 +40,12 @@ Install the direct Python packages:
 python -m pip install -r requirements.txt
 ```
 
+## Dataset
+
+The Plug dataset used in this project is available from Google Drive.
+
+- [Download plug_data](你的Google云盘共享链接)
+
 ## Dataset format
 
 Training and validation data use COCO instance-segmentation JSON. Each split directory contains its images and annotation file:
