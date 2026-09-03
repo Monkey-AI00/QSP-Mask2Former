@@ -23,7 +23,7 @@ QSP-Mask2Former/
 | --- | --- |
 | `configs/base/` | Plug instance-segmentation schedules that inherit from external Mask2Former R50 or Swin-L configurations. |
 | `configs/qsp/` | Main QSP and QSP augmentation configurations. |
-| `configs/ablations/` | Component ablations, geometry-loss comparison, and prior-bank-size experiments. |
+| `configs/ablations/` | Prior-bank-size experiments. |
 | `qsp_mask2former/data/` | COCO dataset loading, background-category filtering, and train/validation registration. |
 | `tools/train_net.py` | Unified Detectron2 launcher for training and `--eval-only` evaluation. |
 | `requirements.txt` | Direct Python dependencies; Detectron2 and the QSP-modified Mask2Former checkout are installed separately. |
