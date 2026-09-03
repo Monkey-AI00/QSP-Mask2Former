@@ -1,5 +1,0 @@
-_BASE_: "../qsp/mask2former_R50_plug_qsp_aug.yaml"
-
-MODEL:
-  MASK_FORMER:
-    PRIOR_ON: False
