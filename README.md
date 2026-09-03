@@ -46,19 +46,6 @@ The Plug dataset used in this project is available from Google Drive.
 
 - [Download plug_data](你的Google云盘共享链接)
 
-## Dataset format
-
-Training and validation data use COCO instance-segmentation JSON. Each split directory contains its images and annotation file:
-
-```text
-datasets/
-├── plug_train/
-│   ├── images or image files
-│   └── plug_train.json
-└── plug_val/
-    ├── images or image files
-    └── plug_val.json
-```
 
 ## Training
 
