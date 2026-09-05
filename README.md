@@ -40,12 +40,6 @@ Install the direct Python packages:
 python -m pip install -r requirements.txt
 ```
 
-## Dataset
-
-The Plug dataset used in this project is available from Google Drive.
-
-- [Download the plug_data](https://drive.google.com/uc?export=download&id=19NNCDXooxJ7B8T9f3zx7ATTTcE2NONFU)
-
 
 ## Training
 
